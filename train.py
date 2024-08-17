@@ -110,13 +110,13 @@ def train_step(
 
         return loss
 
-    # per-device loss and grads
     loss, grads = jax.value_and_grad(loss_fn, has_aux=False)(state.params)
-    # loss, grads = jax.value_and_grad(loss_fn, has_aux=False, reduce_axes=('batch',))(state.params)
-    # average gradients across devices
+
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
+
     new_state = state.apply_gradients(grads=grads)
+
     return loss, new_state
 
 
@@ -180,8 +180,6 @@ def prepare_hellaswag(config):
     all_data = np.array(all_data).reshape(-1, n_devices, 4, config.model.block_size)
     all_labels = np.array(all_labels).reshape(-1, n_devices)
     all_lengths = np.array(all_lengths).reshape(-1, n_devices, 4)
-
-    print(f"all_data shape: {all_data.shape}")
     return all_data, all_labels, all_lengths
 
 
@@ -315,6 +313,7 @@ if __name__ == "__main__":
         config.shuffle_buffer_size,
         seed=config.seed,
     )
+    train_ds = flax.jax_utils.prefetch_to_device(train_ds, 1)
 
     val_ds = get_dataset(config.val_pattern, config.batch_size, block_size)
 
@@ -379,32 +378,29 @@ if __name__ == "__main__":
     # batch hellaswag dataset
     data, labels, lengths = prepare_hellaswag(config)
 
-    train_loss = 0.0
+    train_losses = []
     for step in range(step, config.train_steps):
+        tokens = next(train_iter)
+        loss, train_state = train_step(train_state, tokens, keys_dropout)
+        train_losses.append(loss[0].item())
 
-        if step % config.eval_interval == 0:
-            val_loss = 0.0
-            for _, tokens in zip(range(config.eval_steps), val_ds):
+        if step % config.eval_interval == 0 and step > 0:
+            val_losses = []
+            for _ in range(config.eval_steps):
+                tokens = next(val_ds)
                 loss = eval_step(train_state, tokens)
-                val_loss += loss[0].item()
-            val_loss = val_loss / config.eval_steps
-            print(val_loss)
+                val_losses.append(loss[0].item())
+
+            val_loss = np.mean(val_losses)
+            train_loss = np.mean(train_losses)
 
             # hellaswag
             hellaswag_acc = eval_hellaswag(config, train_state, data, labels, lengths)
-            print(hellaswag_acc)
 
-            if step > 0:
-                train_loss = train_loss / config.eval_interval
-                print(
-                    f"step: {step}, train_loss: {train_loss}, val_loss: {val_loss}",
-                    f"hellaswag_acc: {hellaswag_acc}",
-                )
-            else:
-                print(
-                    f"step: {step}, val_loss: {val_loss}",
-                    f"hellaswag_acc: {hellaswag_acc}",
-                )
+            print(
+                f"step: {step}, train_loss: {train_loss:.4f}, "
+                f"val_loss: {val_loss:.4f}, hellaswag_acc: {hellaswag_acc:.4f}"
+            )
 
             if config.eval_only:
                 break
@@ -425,9 +421,9 @@ if __name__ == "__main__":
             if (config.wandb is not None) and (jax.process_index() == 0):
                 wandb.log(
                     {
-                        "train/loss": train_loss,
-                        "val/loss": val_loss,
-                        "hellaswag/acc": hellaswag_acc,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "hellaswag_acc": hellaswag_acc,
                         "lr": (
                             learning_rate(step)
                             if callable(learning_rate)
@@ -443,8 +439,4 @@ if __name__ == "__main__":
                     step=step,
                 )
 
-            train_loss = 0.0
-
-        tokens = next(train_iter)
-        loss, train_state = train_step(train_state, tokens, keys_dropout)
-        train_loss += loss[0].item()
+            train_losses = []
