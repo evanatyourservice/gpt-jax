@@ -13,7 +13,7 @@ python3 train.py \
     --model.n_embd=512 \
     --model.n_head=8 \
     --model.n_layer=8 \
-    --train.n_inner=2048 \
+    --model.n_inner=2048 \
     --optimizer.weight_decay=0.01 \
     --optimizer.grad_clip=10.0 \
     --optimizer.update_global_norm_clip=5000.0 \
