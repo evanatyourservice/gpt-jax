@@ -1,8 +1,8 @@
 # tyro YAML.
 !dataclass:TrainConfig
 seed: 555
-train_pattern: gs://smol-imagen/openwebtext/train_??.tfrecord
-val_pattern: gs://smol-imagen/openwebtext/val_??.tfrecord
+train_pattern: gs://uscentral1stuff/openwebtext/train_??.tfrecord
+val_pattern: gs://uscentral1stuff/openwebtext/val_??.tfrecord
 shuffle_buffer_size: 128
 eval_interval: 1000
 eval_steps: 50
@@ -23,7 +23,7 @@ learning_rate: !dataclass:CosineDecayScheduleConfig
     decay_steps: 150000
     end_value: 6.4e-5
 wandb: !dataclass:WandbConfig
-    entity: jenkspt
+    entity: evanatyourservice
     project: owt
     name: gpt-124m
     mode: online

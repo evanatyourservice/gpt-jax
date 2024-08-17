@@ -8,12 +8,14 @@ OPTIONS.deterministic = True
 OPTIONS.autotune.enabled = True
 
 
-def get_dataset(pattern: str,
-                batch_size: int = 8,
-                block_size: int = 1024,
-                shuffle_buffer_size: Optional[int] = None,
-                repeat: Optional[int]=None,
-                seed: Optional[int]=None) -> tf.data.Dataset:
+def get_dataset(
+    pattern: str,
+    batch_size: int = 8,
+    block_size: int = 1024,
+    shuffle_buffer_size: Optional[int] = None,
+    repeat: Optional[int] = None,
+    seed: Optional[int] = None,
+) -> tf.data.Dataset.as_numpy_iterator:
 
     tf.random.set_seed(seed)
 
@@ -22,11 +24,12 @@ def get_dataset(pattern: str,
     ds = tf.data.TFRecordDataset(file_ds, num_parallel_reads=tf.data.AUTOTUNE)
     # each element of the dataset is a tokenized string
     feature_description = {
-        'ids': tf.io.FixedLenFeature([], tf.string, default_value=''),
+        "ids": tf.io.FixedLenFeature([], tf.string, default_value="")
     }
+
     def parse_example(example_proto):
         example = tf.io.parse_single_example(example_proto, feature_description)
-        return tf.io.decode_raw(example['ids'], tf.uint16)
+        return tf.io.decode_raw(example["ids"], tf.uint16)
 
     ds = ds.map(parse_example, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.repeat(repeat)
@@ -45,4 +48,6 @@ def get_dataset(pattern: str,
     ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.batch(jax.local_device_count(), drop_remainder=True)
     ds = ds.with_options(OPTIONS)
-    return ds.prefetch(2)
+    ds = ds.prefetch(5)
+    ds = ds.as_numpy_iterator()
+    return ds

@@ -1,27 +1,34 @@
-from typing import Tuple, Optional, Union
+import json
+import time
+from pprint import pprint
+from typing import Tuple
 from dataclasses import dataclass, field, asdict
 from functools import partial
 import os
+import logging
+import sys
+
+import numpy as np
+import tiktoken
+from tqdm import tqdm
+
 import wandb
 import tyro
 
 import jax
 import jax.numpy as jnp
 import flax
-from flax.core import FrozenDict, frozen_dict
 from flax.training import checkpoints
 from flax.training.train_state import TrainState
 from flax.jax_utils import replicate, unreplicate
 import optax
+import tensorflow as tf
+import transformers
 
 from model import GPT, GPTConfig
 from dataset import get_dataset
 from optimizers.psgd_affine import affine
 
-import tensorflow as tf
-
-import logging
-import sys
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
@@ -36,7 +43,7 @@ class WandbConfig:
     """username or team name where you're sending runs"""
     project: str = "owt"
     """project name"""
-    name: str = "test"
+    name: str = ""
     """experiment name"""
     mode: str = "online"
     """'offline', 'online', or 'disabled'"""
@@ -44,53 +51,58 @@ class WandbConfig:
 
 
 @dataclass(frozen=True)
-class LRScheduleConfig:
+class CosineDecayScheduleConfig:
     init_value: float = 0.0
-    peak_value: float = 2.5e-4
-    warmup_steps: int = 2000
-    decay_steps: int = 150000
+    peak_value: float = 0.001
+    warmup_steps: int = 1000
+    decay_steps: int = 50000
     end_value: float = 1e-5
 
 
 @dataclass(frozen=True)
 class TrainConfig:
-    seed: int = 555
-    out_dir: str = "out"  # output directory for checkpoints (can be gcs path)
+    seed: int = 0
+    out_dir: str = (
+        "/Users/evanwalters/gpt_testing"  # output directory for checkpoints (can be gcs path)
+    )
     train_pattern: str = (
-        "train_??.tfrecord"  # training files glob pattern (can be gcs path)
+        "/Users/evanwalters/owt_10k_data/train_??.tfrecord"  # training files glob pattern (can be gcs path)
     )
     val_pattern: str = (
-        "val_??.tfrecord"  # validation files glob pattern (can be gcs path)
+        "/Users/evanwalters/owt_10k_data/val_??.tfrecord"  # validation files glob pattern (can be gcs path)
     )
     shuffle_buffer_size: int = 128
     eval_interval: int = 500
     eval_steps: int = 16  # evaluate for this number of steps (per-device)
+    hs_eval_steps: int = 16  # evaluate for this number of steps (per-device)
     eval_only: bool = False  # if True, script exits right after the first eval
     keep_checkpoints: int = 1  # number of historical checkpoints to keep
     batch_size: int = 16  # per-device batch size
-    train_steps: int = 150000  # total number of training iterations
+    train_steps: int = 50000  # total number of training iterations
     weight_decay: float = 1e-2  # not applied to bias and embedding parameters
     grad_clip: float = 1.0  # gradient norm clipping magnitude
     gradient_accumulation_steps: int = 1  # used to simulate larger batch sizes
     betas: Tuple[float, float] = (0.9, 0.95)  # adamw optimizer betas
-    learning_rate: LRScheduleConfig = field(
-        default_factory=LRScheduleConfig
+    learning_rate: CosineDecayScheduleConfig = field(
+        default_factory=CosineDecayScheduleConfig
     )
     wandb: WandbConfig = field(default_factory=WandbConfig)  # wandb logging
     model: GPTConfig = field(default_factory=GPTConfig)  # gpt model config
     remat: bool = False  # set to True to rematerialize gradients during backward pass
 
 
-@partial(jax.pmap, axis_name="batch")
+@partial(jax.pmap, axis_name="batch", donate_argnums=(0,))
 def train_step(
     state: TrainState, tokens: jnp.ndarray, dropout_key
 ) -> Tuple[jnp.ndarray, TrainState]:
 
     dropout_key = jax.random.fold_in(dropout_key, state.step)
 
-    def loss_fn(params: FrozenDict) -> jnp.ndarray:
+    def loss_fn(params) -> jnp.ndarray:
         X, Y = tokens[:, :-1], tokens[:, 1:]
-        logits = state.apply_fn(params, X, False, rngs={"dropout": dropout_key})
+        logits = state.apply_fn(X, params=params, dropout_rng=dropout_key, train=True)[
+            0
+        ]
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y).mean()
 
         # palm style z loss
@@ -111,80 +123,167 @@ def train_step(
 @partial(jax.pmap, axis_name="batch")
 def eval_step(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
     X, Y = tokens[:, :-1], tokens[:, 1:]
-    logits = state.apply_fn(state.params, X, True)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y)
+    logits = state.apply_fn(X, params=state.params, train=False)[0]
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y).mean()
     loss = jax.lax.pmean(loss, axis_name="batch")
     return loss
 
 
-def evaluate(
-    state: TrainState, ds: tf.data.Dataset, batch_size: int, block_size: int, steps: int
-) -> jnp.ndarray:
-    losses = []
-    for _, tokens in zip(range(steps), ds):
-        tokens = tokens._numpy()
-        loss = eval_step(state, tokens)
-        losses.append(loss)
-    return jnp.mean(jnp.stack(losses))
+@partial(jax.pmap, axis_name="batch")
+def eval_step_raw(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
+    X, Y = tokens[:, :-1], tokens[:, 1:]
+    logits = state.apply_fn(X, params=state.params, train=False)[0]
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y)
+    return loss
 
 
-def count_params(params: FrozenDict) -> int:
+def prepare_hellaswag(config):
+    """Read file and tokenize the hellaswag dataset."""
+    print("preparing hellaswag")
+    enc = tiktoken.get_encoding("gpt2")
+
+    all_data = []
+    all_labels = []
+    all_lengths = []
+    with open("data/hellaswag_val.jsonl", "r") as f:
+        # iterate over lines and tokenize
+        for line in tqdm(f, total=10042):
+            item = json.loads(line)
+            context = item["ctx"]
+            endings = item["endings"]
+            correct_end = item["label"]
+            to_concat = []
+            lens = []
+            for ending in endings:
+                input_text = context + " " + ending
+                input_ids = enc.encode_ordinary(input_text)
+                if len(input_ids) > config.model.block_size:
+                    continue
+                lens.append(len(input_ids))
+                input_ids = np.pad(
+                    input_ids, (0, config.model.block_size - len(input_ids))
+                )
+                to_concat.append(input_ids)
+            all_data.append(np.array(to_concat))
+            all_labels.append(correct_end)
+            all_lengths.append(np.array(lens))
+
+    # cut lists to divisible by n devices
+    n_devices = jax.device_count()
+    n_data = len(all_data)
+    n_data -= n_data % n_devices
+    all_data = all_data[:n_data]
+    all_labels = all_labels[:n_data]
+    all_lengths = all_lengths[:n_data]
+
+    # batch to shape (-1, n_devices, 4, block_size)
+    all_data = np.array(all_data).reshape(-1, n_devices, 4, config.model.block_size)
+    all_labels = np.array(all_labels).reshape(-1, n_devices)
+    all_lengths = np.array(all_lengths).reshape(-1, n_devices, 4)
+
+    print(f"all_data shape: {all_data.shape}")
+    return all_data, all_labels, all_lengths
+
+
+def eval_hellaswag(config, state, data, labels, lengths):
+    """Evaluate the hellaswag dataset."""
+    correct = 0
+    total = 0
+    # select n random examples
+    n = config.hs_eval_steps
+    data = data[np.random.choice(data.shape[0], n, replace=False)]
+    labels = labels[np.random.choice(labels.shape[0], n, replace=False)]
+    lengths = lengths[np.random.choice(lengths.shape[0], n, replace=False)]
+    for i in range(n):
+        batch = data[i]  # (n_devices, 4, block_size)
+        batch_labels = labels[i]  # (n_devices,)
+        batch_lengths = lengths[i]  # (n_devices, 4)
+        losses = eval_step_raw(state, batch)  # (n_devices, 4, block_size)
+        losses = np.array(jax.device_get(losses))
+        for loss_i, label_i, length_i in zip(losses, batch_labels, batch_lengths):
+            losses = [l[:length] for l, length in zip(loss_i, length_i)]  # (4, length)
+            losses = [l.mean() for l in losses]  # (4,)
+            predicted_end = np.argmin(losses)
+            if predicted_end == label_i:
+                correct += 1
+            total += 1
+    return correct / total
+
+
+def count_params(params) -> int:
     p = jax.tree_util.tree_map(
         lambda a: a.size if isinstance(a, jnp.ndarray) else 0, params
     )
     return jax.tree_util.tree_reduce(lambda a, b: a + b, p)
 
 
-def param_decay_mask(params: FrozenDict) -> FrozenDict:
+def param_decay_mask(params):
     """pytree mask for non-bias parameters"""
     flat_params = flax.traverse_util.flatten_dict(params)
     flat_param_mask = {
         k: k[-1] not in ("bias", "embedding", "scale") for k in flat_params.keys()
     }
-    param_mask = flax.traverse_util.unflatten_dict(flat_param_mask)
-    return frozen_dict.freeze(param_mask)
+    return flax.traverse_util.unflatten_dict(flat_param_mask)
 
 
 def init_train_state(key, config: TrainConfig, learning_rate) -> TrainState:
 
-    if config.remat:
-        model = flax.linen.remat(
-            GPT,
-            static_argnums=(2,),
-            policy=jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
-        )(config.model)
-    else:
-        model = GPT(config.model)
+    # if config.remat:
+    #     model = flax.linen.remat(
+    #         GPT,
+    #         static_argnums=(2,),
+    #         policy=jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
+    #     )(config.model)
+    # else:
+    #     model = GPT(config.model)
+    model_config = transformers.GPT2Config(
+        n_embd=config.model.num_embeds,
+        n_layer=config.model.num_layers,
+        n_head=config.model.num_heads,
+        use_cache=False,
+        initializer_range=0.01,
+        scale_attn_by_inverse_layer_idx=True,
+        reorder_and_upcast_attn=True,
+    )
 
-    params = model.init(key)
+    model = transformers.FlaxAutoModelForCausalLM.from_config(model_config)
+    params = model.params
+    # pprint(params)
 
     optimizer = optax.chain(
         # Apply weight decay only to non-bias parameters
         optax.clip_by_global_norm(config.grad_clip),
-        # optax.adamw(learning_rate, *config.betas, weight_decay=config.weight_decay, mask=param_decay_mask(params)),
-        affine(
-            learning_rate=learning_rate,
-            preconditioner_update_probability=1.0,
-            b1=config.betas[0],
-            b2=config.betas[1],
-            nesterov=True,
-            update_global_norm_clip=None,
-            update_elementwise_clip=False,
+        optax.adamw(
+            learning_rate,
+            *config.betas,
             weight_decay=config.weight_decay,
             mask=param_decay_mask,
-            max_size_triangular=0,
-            max_skew_triangular=0,
-            step_normalizer_order="2nd",
-            precond_lr=0.01,
-            precond_init_scale=1.0,
-            seed=None,
-            mu_dtype=jnp.bfloat16,
-            precision="tensorfloat32",
         ),
+        # affine(
+        #     learning_rate=learning_rate,
+        #     preconditioner_update_probability=1.0,
+        #     b1=config.betas[0],
+        #     b2=config.betas[1],
+        #     nesterov=True,
+        #     update_global_norm_clip=None,
+        #     update_elementwise_clip=False,
+        #     weight_decay=config.weight_decay,
+        #     mask=param_decay_mask,
+        #     max_size_triangular=0,
+        #     max_skew_triangular=0,
+        #     step_normalizer_order="2nd",
+        #     precond_lr=0.01,
+        #     precond_init_scale=1.0,
+        #     seed=None,
+        #     mu_dtype=jnp.bfloat16,
+        #     precision="tensorfloat32",
+        # ),
         optax.apply_every(config.gradient_accumulation_steps),
     )
 
-    train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
+    train_state = TrainState.create(
+        apply_fn=model.__call__, params=params, tx=optimizer
+    )
 
     return train_state
 
@@ -217,7 +316,7 @@ if __name__ == "__main__":
         seed=config.seed,
     )
 
-    val_ds = get_dataset(config.val_pattern, config.batch_size, block_size, repeat=1)
+    val_ds = get_dataset(config.val_pattern, config.batch_size, block_size)
 
     # =====  init parameters ============
     key = jax.random.PRNGKey(config.seed)
@@ -275,12 +374,35 @@ if __name__ == "__main__":
     # replicate parameters to each device
     train_state = replicate(train_state)
 
+    # batch hellaswag dataset
+    data, labels, lengths = prepare_hellaswag(config)
+
+    train_loss = 0.0
     for step in range(step, config.train_steps):
 
         if step % config.eval_interval == 0:
-            val_loss = evaluate(
-                train_state, val_ds, config.batch_size, block_size, config.eval_steps
-            )
+            val_loss = 0.0
+            for _, tokens in zip(range(config.eval_steps), val_ds):
+                loss = eval_step(train_state, tokens)
+                val_loss += loss[0].item()
+            val_loss = val_loss / config.eval_steps
+            print(val_loss)
+
+            # hellaswag
+            hellaswag_acc = eval_hellaswag(train_state, data, labels, lengths)
+            print(hellaswag_acc)
+
+            if step > 0:
+                train_loss = train_loss / config.eval_interval
+                print(
+                    f"step: {step}, train_loss: {train_loss}, val_loss: {val_loss}",
+                    f"hellaswag_acc: {hellaswag_acc}",
+                )
+            else:
+                print(
+                    f"step: {step}, val_loss: {val_loss}",
+                    f"hellaswag_acc: {hellaswag_acc}",
+                )
 
             if config.eval_only:
                 break
@@ -299,22 +421,28 @@ if __name__ == "__main__":
                 dataset_manager.save(step)
 
             if (config.wandb is not None) and (jax.process_index() == 0):
-                wandb.log({"val/loss": val_loss}, step=step)
+                wandb.log(
+                    {
+                        "train/loss": train_loss,
+                        "val/loss": val_loss,
+                        "hellaswag/acc": hellaswag_acc,
+                        "lr": (
+                            learning_rate(step)
+                            if callable(learning_rate)
+                            else learning_rate
+                        ),
+                        "step": step,
+                        "block": step * config.batch_size * jax.device_count(),
+                        "tokens": step
+                        * config.batch_size
+                        * jax.device_count()
+                        * block_size,
+                    },
+                    step=step,
+                )
 
-        tokens = next(train_iter)._numpy()
+            train_loss = 0.0
+
+        tokens = next(train_iter)
         loss, train_state = train_step(train_state, tokens, keys_dropout)
-
-        if (config.wandb is not None) and (jax.process_index() == 0):
-            wandb.log(
-                {
-                    "train/loss": loss[0].item(),
-                    "lr": (
-                        learning_rate(step)
-                        if callable(learning_rate)
-                        else learning_rate
-                    ),
-                    "step": step,
-                    "block": step * config.batch_size * jax.device_count(),
-                },
-                step=step,
-            )
+        train_loss += loss[0].item()

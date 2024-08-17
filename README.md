@@ -12,20 +12,36 @@ Currently the GPT2 124M parameter model reaches 2.906 validation loss after trai
 # Steps to Reproduce
 ## Prepare OpenWebText
 
+Install Conda
+```shell
+mkdir -p ~/miniconda3
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda3/miniconda.sh
+bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3
+rm -rf ~/miniconda3/miniconda.sh
+~/miniconda3/bin/conda init bash
+~/miniconda3/bin/conda init zsh
+```
+
+Restart shell and create a new conda environment
+```shell
+conda create -n gpt python=3.9 -y
+conda activate gpt
+```
+
 Clone gpt-jax
 ```shell
 git clone https://github.com/jenkspt/gpt-jax.git
 cd gpt-jax
 ```
 
-Install python dependencies
+Install python dependencies TPU
 ```shell
-pip install -U pip
-pip install tqdm
-pip install numpy
-pip install tiktoken
-pip install datasets
-pip install tensorflow
+pip install -U pip && pip install -r requirements.txt && pip install --force-reinstall --upgrade --no-cache-dir "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html && pip install "numpy<2"
+```
+
+Install python dependencies GPU
+```shell
+pip install -U pip && pip install -r requirements.txt && pip install --force-reinstall --upgrade --no-cache-dir "jax[cuda12]" && pip install "numpy<2"
 ```
 
 Prepare data
