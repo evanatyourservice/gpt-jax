@@ -76,7 +76,7 @@ class TrainConfig:
     eval_steps: int = 16  # evaluate for this number of steps (per-device)
     hs_eval_steps: int = 16  # evaluate for this number of steps (per-device)
     eval_only: bool = False  # if True, script exits right after the first eval
-    keep_checkpoints: int = 1  # number of historical checkpoints to keep
+    keep_checkpoints: int = 0  # number of historical checkpoints to keep
     batch_size: int = 16  # per-device batch size
     train_steps: int = 50000  # total number of training iterations
     weight_decay: float = 1e-2  # not applied to bias and embedding parameters
@@ -354,9 +354,10 @@ if __name__ == "__main__":
     # ==== restore dataset and train state ==== #
     # restore unreplicated optimizer + model state from last checkpoint.
     # this is a no-op if no checkpoints exist
-    train_state = checkpoints.restore_checkpoint(
-        f"{config.out_dir}/checkpoints/train_state", train_state
-    )
+    if config.keep_checkpoints > 0:
+        train_state = checkpoints.restore_checkpoint(
+            f"{config.out_dir}/checkpoints/train_state", train_state
+        )
 
     # grab step from last checkpoint
     step = int(train_state.step)
@@ -364,12 +365,13 @@ if __name__ == "__main__":
     train_iter = iter(train_ds)
     # We need to be able to save the dataset state for stopping and resuming training
     # we'll save a dataset checkpoint for each shard
-    dataset_manager = tf.train.CheckpointManager(
-        tf.train.Checkpoint(iterator=train_iter),
-        f"{config.out_dir}/checkpoints/dataset_{jax.process_index()}",
-        max_to_keep=config.keep_checkpoints,
-    )
-    dataset_manager.restore_or_initialize()
+    if config.keep_checkpoints > 0:
+        dataset_manager = tf.train.CheckpointManager(
+            tf.train.Checkpoint(iterator=train_iter),
+            f"{config.out_dir}/checkpoints/dataset_{jax.process_index()}",
+            max_to_keep=config.keep_checkpoints,
+        )
+        dataset_manager.restore_or_initialize()
 
     # replicate parameters to each device
     train_state = replicate(train_state)
@@ -407,7 +409,7 @@ if __name__ == "__main__":
             if config.eval_only:
                 break
 
-            if val_loss < best_val_loss:
+            if val_loss < best_val_loss and config.keep_checkpoints > 0:
                 best_val_loss = val_loss
                 if jax.process_index() == 0:
                     # save train state in process 0

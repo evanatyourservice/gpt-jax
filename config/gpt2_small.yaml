@@ -8,7 +8,7 @@ eval_interval: 300
 eval_steps: 20
 hs_eval_steps: 20
 eval_only: False
-keep_checkpoints: 1
+keep_checkpoints: 0
 batch_size: 16
 train_steps: 50000
 weight_decay: 0.1
