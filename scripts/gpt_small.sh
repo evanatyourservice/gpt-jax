@@ -10,6 +10,7 @@ python3 train.py \
     --out_dir=gs://uscentral1stuff/gpt_models/gpt_small/$EXPERIMENT \
     --train_pattern=gs://uscentral1stuff/openwebtext/train_??.tfrecord \
     --val_pattern=gs://uscentral1stuff/openwebtext/val_??.tfrecord \
+    --bfloat16_compute \
     --model.n_embd=512 \
     --model.n_head=8 \
     --model.n_layer=8 \

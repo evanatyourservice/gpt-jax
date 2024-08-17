@@ -115,24 +115,31 @@ class TrainConfig:
     keep_checkpoints: int = 0  # number of historical checkpoints to keep
     batch_size: int = 16  # per-device batch size
     train_steps: int = 50000  # total number of training iterations
+    bfloat16_compute: bool = False  # use bfloat16 for compute
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)  # wandb logging
     model: GPT2Config = field(default_factory=GPT2Config)  # gpt model config
     remat: bool = False  # set to True to rematerialize gradients during backward pass
 
 
-@partial(jax.pmap, axis_name="batch", donate_argnums=(0,))
+@partial(
+    jax.pmap, axis_name="batch", donate_argnums=(0,), static_broadcasted_argnums=(3,)
+)
 def train_step(
-    state: TrainState, tokens: jnp.ndarray, dropout_key
+    state: TrainState, tokens: jnp.ndarray, dropout_key, use_bfloat16: bool
 ) -> Tuple[jnp.ndarray, TrainState]:
 
     dropout_key = jax.random.fold_in(dropout_key, state.step)
 
     def loss_fn(params) -> jnp.ndarray:
         X, Y = tokens[:, :-1], tokens[:, 1:]
+        if use_bfloat16:
+            X = X.astype(jnp.bfloat16)
+            params = optax.tree_utils.tree_cast(params, jnp.bfloat16)
         logits = state.apply_fn(X, params=params, dropout_rng=dropout_key, train=True)[
             0
         ]
+        logits = logits.astype(jnp.float32)
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y).mean()
 
         # palm style z loss
@@ -403,7 +410,9 @@ if __name__ == "__main__":
     print("starting training")
     for step in range(step, config.train_steps):
         tokens = next(train_iter)
-        loss, train_state = train_step(train_state, tokens, keys_dropout)
+        loss, train_state = train_step(
+            train_state, tokens, keys_dropout, config.bfloat16_compute
+        )
         train_losses.append(loss[0].item())
 
         if step % config.eval_interval == 0 and step > 0:
