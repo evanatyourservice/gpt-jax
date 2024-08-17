@@ -2,6 +2,7 @@
 # saves the openwebtext dataset to a binary file for training. following was helpful:
 # https://github.com/HazyResearch/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
 
+import os
 from multiprocessing import cpu_count
 from tqdm import tqdm
 import numpy as np
@@ -9,13 +10,18 @@ import tiktoken
 from datasets import load_dataset, DatasetDict
 import tensorflow as tf
 
+
+save_dir = "/dev/shm/openwebtext"
+os.makedirs(save_dir, exist_ok=True)
+
+
 # number of workers in .map() call
 # good number to use is ~order number of cpu cores // 2
 num_proc = cpu_count() // 2
 num_shards = {'train': 32, 'val': 8}
 
 # takes 54GB in huggingface .cache dir, about 8M documents (8,013,769)
-dataset = load_dataset("openwebtext")
+dataset = load_dataset("openwebtext", cache_dir="/dev/shm/hf_cache")
 
 # owt by default only contains the 'train' split, so create a test split
 split_dataset = dataset["train"].train_test_split(test_size=0.0005, seed=2357, shuffle=True)
@@ -71,9 +77,10 @@ def _bytes_feature(value):
 # concatenate all the ids in each dataset into one large file we can use for training
 for split, dset in tokenized.items():
     filename = f'{split}.tfrecord'
+    full_path = os.path.join(save_dir, filename)
 
-    print(f"writing {filename}...")
-    with tf.io.TFRecordWriter(filename) as writer:
+    print(f"writing {full_path}...")
+    with tf.io.TFRecordWriter(full_path) as writer:
         for example in tqdm(dset):
             feature = np.asarray(example['ids'], dtype=np.uint16).tobytes()
             example_proto = tf.train.Example(

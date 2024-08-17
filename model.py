@@ -15,8 +15,8 @@ class GPTConfig:
     num_layers: int = 12
     num_heads: int = 12
     num_embeds: int = 768
-    dropout_rate: float = 0.1
-    use_bias: bool = True
+    dropout_rate: float = 0.05
+    use_bias: bool = False
     dtype: Optional[str] = None
 
 

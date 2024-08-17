@@ -16,11 +16,13 @@ import optax
 
 from model import GPT, GPTConfig
 from dataset import get_dataset
+from optimizers.psgd_affine import affine
 
 import tensorflow as tf
 
 import logging
 import sys
+
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
 
@@ -29,19 +31,20 @@ class WandbConfig:
     """
     wandb logging configuration
     """
-    entity: str = 'jenkspt'
+
+    entity: str = "evanatyourservice"
     """username or team name where you're sending runs"""
-    project: str = 'owt'
+    project: str = "owt"
     """project name"""
-    name: str = 'test'
+    name: str = "test"
     """experiment name"""
-    mode: str = 'online'
+    mode: str = "online"
     """'offline', 'online', or 'disabled'"""
-    notes: str = ''
+    notes: str = ""
 
 
 @dataclass(frozen=True)
-class CosineDecayScheduleConfig:
+class LRScheduleConfig:
     init_value: float = 0.0
     peak_value: float = 2.5e-4
     warmup_steps: int = 2000
@@ -52,40 +55,52 @@ class CosineDecayScheduleConfig:
 @dataclass(frozen=True)
 class TrainConfig:
     seed: int = 555
-    out_dir: str = 'out'                        # output directory for checkpoints (can be gcs path)
-    train_pattern: str = 'train_??.tfrecord'    # training files glob pattern (can be gcs path)
-    val_pattern: str = 'val_??.tfrecord'        # validation files glob pattern (can be gcs path)
+    out_dir: str = "out"  # output directory for checkpoints (can be gcs path)
+    train_pattern: str = (
+        "train_??.tfrecord"  # training files glob pattern (can be gcs path)
+    )
+    val_pattern: str = (
+        "val_??.tfrecord"  # validation files glob pattern (can be gcs path)
+    )
     shuffle_buffer_size: int = 128
     eval_interval: int = 500
-    eval_steps: int = 16        # evaluate for this number of steps (per-device)
-    eval_only: bool = False     # if True, script exits right after the first eval
-    keep_checkpoints: int = 3   # number of historical checkpoints to keep
-    batch_size: int = 16        # per-device batch size
-    train_steps: int = 150000   # total number of training iterations
+    eval_steps: int = 16  # evaluate for this number of steps (per-device)
+    eval_only: bool = False  # if True, script exits right after the first eval
+    keep_checkpoints: int = 1  # number of historical checkpoints to keep
+    batch_size: int = 16  # per-device batch size
+    train_steps: int = 150000  # total number of training iterations
     weight_decay: float = 1e-2  # not applied to bias and embedding parameters
-    grad_clip: float = 1.0      # gradient norm clipping magnitude
-    gradient_accumulation_steps: int = 1    # used to simulate larger batch sizes
-    betas: Tuple[float, float] = (0.9, 0.95) # adamw optimizer betas
-    learning_rate: CosineDecayScheduleConfig = field(default_factory=CosineDecayScheduleConfig)
-    wandb: WandbConfig = field(default_factory=WandbConfig) # wandb logging
-    model: GPTConfig = field(default_factory=GPTConfig)     # gpt model config
-    remat: bool = False    # set to True to rematerialize gradients during backward pass
+    grad_clip: float = 1.0  # gradient norm clipping magnitude
+    gradient_accumulation_steps: int = 1  # used to simulate larger batch sizes
+    betas: Tuple[float, float] = (0.9, 0.95)  # adamw optimizer betas
+    learning_rate: LRScheduleConfig = field(
+        default_factory=LRScheduleConfig
+    )
+    wandb: WandbConfig = field(default_factory=WandbConfig)  # wandb logging
+    model: GPTConfig = field(default_factory=GPTConfig)  # gpt model config
+    remat: bool = False  # set to True to rematerialize gradients during backward pass
 
 
-@partial(jax.pmap, axis_name='batch')
-def train_step(state: TrainState, tokens: jnp.ndarray, dropout_key) -> Tuple[jnp.ndarray, TrainState]:
+@partial(jax.pmap, axis_name="batch")
+def train_step(
+    state: TrainState, tokens: jnp.ndarray, dropout_key
+) -> Tuple[jnp.ndarray, TrainState]:
 
     dropout_key = jax.random.fold_in(dropout_key, state.step)
 
     def loss_fn(params: FrozenDict) -> jnp.ndarray:
         X, Y = tokens[:, :-1], tokens[:, 1:]
-        logits = state.apply_fn(params, X, False, rngs={'dropout': dropout_key})
+        logits = state.apply_fn(params, X, False, rngs={"dropout": dropout_key})
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y).mean()
+
+        # palm style z loss
+        loss += 1e-4 * jax.scipy.special.logsumexp(logits, axis=-1).mean() ** 2
+
         return loss
-    
+
     # per-device loss and grads
     loss, grads = jax.value_and_grad(loss_fn, has_aux=False)(state.params)
-    #loss, grads = jax.value_and_grad(loss_fn, has_aux=False, reduce_axes=('batch',))(state.params)
+    # loss, grads = jax.value_and_grad(loss_fn, has_aux=False, reduce_axes=('batch',))(state.params)
     # average gradients across devices
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -93,7 +108,7 @@ def train_step(state: TrainState, tokens: jnp.ndarray, dropout_key) -> Tuple[jnp
     return loss, new_state
 
 
-@partial(jax.pmap, axis_name='batch')
+@partial(jax.pmap, axis_name="batch")
 def eval_step(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
     X, Y = tokens[:, :-1], tokens[:, 1:]
     logits = state.apply_fn(state.params, X, True)
@@ -102,7 +117,9 @@ def eval_step(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
     return loss
 
 
-def evaluate(state: TrainState, ds: tf.data.Dataset, batch_size: int, block_size: int, steps: int) -> jnp.ndarray:
+def evaluate(
+    state: TrainState, ds: tf.data.Dataset, batch_size: int, block_size: int, steps: int
+) -> jnp.ndarray:
     losses = []
     for _, tokens in zip(range(steps), ds):
         tokens = tokens._numpy()
@@ -112,14 +129,18 @@ def evaluate(state: TrainState, ds: tf.data.Dataset, batch_size: int, block_size
 
 
 def count_params(params: FrozenDict) -> int:
-    p = jax.tree_util.tree_map(lambda a: a.size if isinstance(a, jnp.ndarray) else 0, params)
+    p = jax.tree_util.tree_map(
+        lambda a: a.size if isinstance(a, jnp.ndarray) else 0, params
+    )
     return jax.tree_util.tree_reduce(lambda a, b: a + b, p)
 
 
 def param_decay_mask(params: FrozenDict) -> FrozenDict:
-    """ pytree mask for non-bias parameters """
+    """pytree mask for non-bias parameters"""
     flat_params = flax.traverse_util.flatten_dict(params)
-    flat_param_mask = {k: k[-1] not in ('bias', 'embedding', 'scale') for k in flat_params.keys()}
+    flat_param_mask = {
+        k: k[-1] not in ("bias", "embedding", "scale") for k in flat_params.keys()
+    }
     param_mask = flax.traverse_util.unflatten_dict(flat_param_mask)
     return frozen_dict.freeze(param_mask)
 
@@ -127,9 +148,11 @@ def param_decay_mask(params: FrozenDict) -> FrozenDict:
 def init_train_state(key, config: TrainConfig, learning_rate) -> TrainState:
 
     if config.remat:
-        model = flax.linen.remat(GPT,
+        model = flax.linen.remat(
+            GPT,
             static_argnums=(2,),
-            policy=jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims)(config.model)
+            policy=jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
+        )(config.model)
     else:
         model = GPT(config.model)
 
@@ -138,25 +161,41 @@ def init_train_state(key, config: TrainConfig, learning_rate) -> TrainState:
     optimizer = optax.chain(
         # Apply weight decay only to non-bias parameters
         optax.clip_by_global_norm(config.grad_clip),
-        optax.adamw(learning_rate, *config.betas, weight_decay=config.weight_decay, mask=param_decay_mask(params)),
+        # optax.adamw(learning_rate, *config.betas, weight_decay=config.weight_decay, mask=param_decay_mask(params)),
+        affine(
+            learning_rate=learning_rate,
+            preconditioner_update_probability=1.0,
+            b1=config.betas[0],
+            b2=config.betas[1],
+            nesterov=True,
+            update_global_norm_clip=None,
+            update_elementwise_clip=False,
+            weight_decay=config.weight_decay,
+            mask=param_decay_mask,
+            max_size_triangular=0,
+            max_skew_triangular=0,
+            step_normalizer_order="2nd",
+            precond_lr=0.01,
+            precond_init_scale=1.0,
+            seed=None,
+            mu_dtype=jnp.bfloat16,
+            precision="tensorfloat32",
+        ),
         optax.apply_every(config.gradient_accumulation_steps),
     )
 
-    train_state = TrainState.create(
-        apply_fn=model.apply,
-        params=params,
-        tx=optimizer)
+    train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
 
     return train_state
 
 
 def get_default_config() -> TrainConfig:
     # use this file to set default values
-    path = os.environ.get('GPT_CONFIG', os.path.join('config', 'gpt2.yaml'))
+    path = os.environ.get("GPT_CONFIG", os.path.join("config", "gpt2.yaml"))
     if not os.path.exists(path):
         return TrainConfig()
-    logging.info(f'using config file at {path}')
-    with open(path, 'r') as f:
+    logging.info(f"using config file at {path}")
+    with open(path, "r") as f:
         return tyro.from_yaml(TrainConfig, f)
 
 
@@ -171,13 +210,14 @@ if __name__ == "__main__":
 
     # ===== datasets =====
     train_ds = get_dataset(
-        config.train_pattern, config.batch_size,
-        block_size, config.shuffle_buffer_size,
-        seed = config.seed)
+        config.train_pattern,
+        config.batch_size,
+        block_size,
+        config.shuffle_buffer_size,
+        seed=config.seed,
+    )
 
-    val_ds = get_dataset(
-        config.val_pattern, config.batch_size,
-        block_size, repeat=1)
+    val_ds = get_dataset(config.val_pattern, config.batch_size, block_size, repeat=1)
 
     # =====  init parameters ============
     key = jax.random.PRNGKey(config.seed)
@@ -187,26 +227,40 @@ if __name__ == "__main__":
     keys_dropout = jax.random.split(key_dropout, jax.local_device_count())
 
     # ===== learning rate schedule =====
-    learning_rate = optax.warmup_cosine_decay_schedule(**asdict(config.learning_rate))
+    learning_rate = optax.join_schedules(
+        schedules=[
+            optax.linear_schedule(
+                config.learning_rate.init_value,
+                config.learning_rate.peak_value,
+                config.learning_rate.warmup_steps,
+            ),
+            optax.linear_schedule(
+                config.learning_rate.peak_value,
+                config.learning_rate.end_value,
+                config.learning_rate.decay_steps - config.learning_rate.warmup_steps,
+            ),
+        ],
+        boundaries=[config.learning_rate.warmup_steps],
+    )
 
     train_state = init_train_state(key_params, config, learning_rate)
 
     num_params = count_params(train_state.params)
     if jax.process_index() == 0:
-        #logging.info(f'PARAMETER COUNT: {num_params:,}')
-        print(f'PARAMETER COUNT: {num_params:,}')
+        # logging.info(f'PARAMETER COUNT: {num_params:,}')
+        print(f"PARAMETER COUNT: {num_params:,}")
 
-    best_val_loss = float('inf')
+    best_val_loss = float("inf")
 
     # ==== restore dataset and train state ==== #
     # restore unreplicated optimizer + model state from last checkpoint.
     # this is a no-op if no checkpoints exist
     train_state = checkpoints.restore_checkpoint(
-        f'{config.out_dir}/checkpoints/train_state', train_state)
+        f"{config.out_dir}/checkpoints/train_state", train_state
+    )
 
     # grab step from last checkpoint
     step = int(train_state.step)
-
 
     train_iter = iter(train_ds)
     # We need to be able to save the dataset state for stopping and resuming training
@@ -214,7 +268,8 @@ if __name__ == "__main__":
     dataset_manager = tf.train.CheckpointManager(
         tf.train.Checkpoint(iterator=train_iter),
         f"{config.out_dir}/checkpoints/dataset_{jax.process_index()}",
-        max_to_keep=config.keep_checkpoints)
+        max_to_keep=config.keep_checkpoints,
+    )
     dataset_manager.restore_or_initialize()
 
     # replicate parameters to each device
@@ -223,21 +278,26 @@ if __name__ == "__main__":
     for step in range(step, config.train_steps):
 
         if step % config.eval_interval == 0:
-            val_loss = evaluate(train_state, val_ds, config.batch_size,
-                                block_size, config.eval_steps)
+            val_loss = evaluate(
+                train_state, val_ds, config.batch_size, block_size, config.eval_steps
+            )
 
             if config.eval_only:
                 break
 
-            if (val_loss < best_val_loss):
+            if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 if jax.process_index() == 0:
                     # save train state in process 0
                     checkpoints.save_checkpoint(
-                        f'{config.out_dir}/checkpoints/train_state',
-                        unreplicate(train_state), step, keep=config.keep_checkpoints, overwrite=True)
+                        f"{config.out_dir}/checkpoints/train_state",
+                        unreplicate(train_state),
+                        step,
+                        keep=config.keep_checkpoints,
+                        overwrite=True,
+                    )
                 dataset_manager.save(step)
-                
+
             if (config.wandb is not None) and (jax.process_index() == 0):
                 wandb.log({"val/loss": val_loss}, step=step)
 
@@ -245,9 +305,16 @@ if __name__ == "__main__":
         loss, train_state = train_step(train_state, tokens, keys_dropout)
 
         if (config.wandb is not None) and (jax.process_index() == 0):
-            wandb.log({
-                "train/loss": loss[0].item(),
-                "lr": learning_rate(step) if callable(learning_rate) else learning_rate,
-                "step": step,
-                "block": step * config.batch_size * jax.device_count(),
-            }, step=step)
+            wandb.log(
+                {
+                    "train/loss": loss[0].item(),
+                    "lr": (
+                        learning_rate(step)
+                        if callable(learning_rate)
+                        else learning_rate
+                    ),
+                    "step": step,
+                    "block": step * config.batch_size * jax.device_count(),
+                },
+                step=step,
+            )
