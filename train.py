@@ -1,5 +1,4 @@
 import json
-import time
 from pprint import pprint
 from typing import Tuple, Optional
 from dataclasses import dataclass, field, asdict
@@ -268,7 +267,7 @@ def init_train_state(key, config: TrainConfig, learning_rate) -> TrainState:
     model_config = transformers.GPT2Config(**asdict(config.model))
     model = transformers.FlaxAutoModelForCausalLM.from_config(model_config)
     params = model.params
-    pprint(params, indent=2, width=120, compact=True)
+    pprint(jax.tree.map(lambda x: x.shape, params), indent=2, width=120, compact=True)
 
     optimizer = []
     optimizer.append(optax.clip_by_global_norm(config.optimizer.grad_clip))
@@ -402,6 +401,8 @@ if __name__ == "__main__":
             max_to_keep=config.keep_checkpoints,
         )
         dataset_manager.restore_or_initialize()
+    else:
+        dataset_manager = None
 
     # replicate parameters to each device
     train_state = replicate(train_state)
