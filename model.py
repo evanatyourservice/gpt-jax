@@ -41,10 +41,6 @@ class SelfAttention(nn.Module):
         qkv = qkv.reshape(B, T, 3 * self.num_heads, head_dim)
         q, k, v = jnp.array_split(qkv, 3, axis=2)
 
-        # qk normalization
-        q = nn.LayerNorm(use_bias=False, use_scale=False)(q)
-        k = nn.LayerNorm(use_bias=False, use_scale=False)(k)
-
         # calculate attention matrix
         scale = 1.0 / jnp.sqrt(head_dim).astype(self.dtype)
         # attn weight shape is (batch..., num_heads, q_length, kv_length)

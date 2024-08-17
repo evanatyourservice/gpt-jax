@@ -1,7 +1,7 @@
 import json
 import time
 from pprint import pprint
-from typing import Tuple
+from typing import Tuple, Optional
 from dataclasses import dataclass, field, asdict
 from functools import partial
 import os
@@ -25,12 +25,38 @@ import optax
 import tensorflow as tf
 import transformers
 
-from model import GPT, GPTConfig
 from dataset import get_dataset
 from optimizers.psgd_affine import affine
 
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+
+
+@dataclass(frozen=True)
+class GPT2Config:
+    vocab_size: int = 50257
+    n_positions: int = 1024
+    n_embd: int = 768
+    n_layer: int = 12
+    n_head: int = 12
+    n_inner: int = None
+    activation_function: str = "gelu_new"
+    resid_pdrop: float = 0.1
+    embd_pdrop: float = 0.1
+    attn_pdrop: float = 0.1
+    layer_norm_epsilon: float = 0.00001
+    initializer_range: float = 0.02
+    summary_type: str = "cls_index"
+    summary_use_proj: bool = True
+    summary_activation: str = None
+    summary_proj_to_labels: bool = True
+    summary_first_dropout: float = 0.1
+    scale_attn_weights: bool = True
+    use_cache: bool = True
+    bos_token_id: int = 50256
+    eos_token_id: int = 50256
+    scale_attn_by_inverse_layer_idx: bool = False
+    reorder_and_upcast_attn: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,25 +77,35 @@ class WandbConfig:
 
 
 @dataclass(frozen=True)
-class CosineDecayScheduleConfig:
-    init_value: float = 0.0
-    peak_value: float = 0.001
+class OptimizerConfig:
+    type: str = "psgd_affine"
+    learning_rate: float = 0.001
     warmup_steps: int = 1000
-    decay_steps: int = 50000
-    end_value: float = 1e-5
+    weight_decay: float = 0.1
+    grad_clip: float = 1.0
+    gradient_accumulation_steps: int = 1
+    betas: Tuple[float, float] = (0.9, 0.95)
+    preconditioner_update_probability: float = 1.0
+    update_global_norm_clip: Optional[float] = None
+    update_elementwise_clip: bool = False
+    max_size_triangular: int = 0
+    max_skew_triangular: int = 0
+    precond_lr: float = 1.0
+    precond_init_scale: float = 1.0
+    adaptive: bool = True
 
 
 @dataclass(frozen=True)
 class TrainConfig:
     seed: int = 0
-    out_dir: str = (
-        "/Users/evanwalters/gpt_testing"  # output directory for checkpoints (can be gcs path)
-    )
+    out_dir: str = os.path.expanduser(
+        "~/gpt_out_dir"
+    )  # output directory for checkpoints (can be gcs path)
     train_pattern: str = (
-        "/Users/evanwalters/owt_10k_data/train_??.tfrecord"  # training files glob pattern (can be gcs path)
+        "owt_data/train_??.tfrecord"  # training files glob pattern (can be gcs path)
     )
     val_pattern: str = (
-        "/Users/evanwalters/owt_10k_data/val_??.tfrecord"  # validation files glob pattern (can be gcs path)
+        "owt_data/val_??.tfrecord"  # validation files glob pattern (can be gcs path)
     )
     shuffle_buffer_size: int = 128
     eval_interval: int = 500
@@ -79,15 +115,9 @@ class TrainConfig:
     keep_checkpoints: int = 0  # number of historical checkpoints to keep
     batch_size: int = 16  # per-device batch size
     train_steps: int = 50000  # total number of training iterations
-    weight_decay: float = 1e-2  # not applied to bias and embedding parameters
-    grad_clip: float = 1.0  # gradient norm clipping magnitude
-    gradient_accumulation_steps: int = 1  # used to simulate larger batch sizes
-    betas: Tuple[float, float] = (0.9, 0.95)  # adamw optimizer betas
-    learning_rate: CosineDecayScheduleConfig = field(
-        default_factory=CosineDecayScheduleConfig
-    )
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)  # wandb logging
-    model: GPTConfig = field(default_factory=GPTConfig)  # gpt model config
+    model: GPT2Config = field(default_factory=GPT2Config)  # gpt model config
     remat: bool = False  # set to True to rematerialize gradients during backward pass
 
 
@@ -137,7 +167,7 @@ def eval_step_raw(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
     return loss
 
 
-def prepare_hellaswag(config):
+def prepare_hellaswag(config: TrainConfig):
     """Read file and tokenize the hellaswag dataset."""
     print("preparing hellaswag")
     enc = tiktoken.get_encoding("gpt2")
@@ -157,11 +187,11 @@ def prepare_hellaswag(config):
             for ending in endings:
                 input_text = context + " " + ending
                 input_ids = enc.encode_ordinary(input_text)
-                if len(input_ids) > config.model.block_size:
+                if len(input_ids) > config.model.n_positions:
                     continue
                 lens.append(len(input_ids))
                 input_ids = np.pad(
-                    input_ids, (0, config.model.block_size - len(input_ids))
+                    input_ids, (0, config.model.n_positions - len(input_ids))
                 )
                 to_concat.append(input_ids)
             all_data.append(np.array(to_concat))
@@ -177,7 +207,7 @@ def prepare_hellaswag(config):
     all_lengths = all_lengths[:n_data]
 
     # batch to shape (-1, n_devices, 4, block_size)
-    all_data = np.array(all_data).reshape(-1, n_devices, 4, config.model.block_size)
+    all_data = np.array(all_data).reshape(-1, n_devices, 4, config.model.n_positions)
     all_labels = np.array(all_labels).reshape(-1, n_devices)
     all_lengths = np.array(all_lengths).reshape(-1, n_devices, 4)
     return all_data, all_labels, all_lengths
@@ -225,59 +255,52 @@ def param_decay_mask(params):
 
 
 def init_train_state(key, config: TrainConfig, learning_rate) -> TrainState:
-
-    # if config.remat:
-    #     model = flax.linen.remat(
-    #         GPT,
-    #         static_argnums=(2,),
-    #         policy=jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
-    #     )(config.model)
-    # else:
-    #     model = GPT(config.model)
-    model_config = transformers.GPT2Config(
-        n_embd=config.model.num_embeds,
-        n_layer=config.model.num_layers,
-        n_head=config.model.num_heads,
-        use_cache=False,
-        initializer_range=0.01,
-        scale_attn_by_inverse_layer_idx=True,
-        reorder_and_upcast_attn=True,
-    )
-
+    model_config = transformers.GPT2Config(**asdict(config.model))
     model = transformers.FlaxAutoModelForCausalLM.from_config(model_config)
     params = model.params
     # pprint(params)
 
-    optimizer = optax.chain(
-        # Apply weight decay only to non-bias parameters
-        optax.clip_by_global_norm(config.grad_clip),
-        optax.adamw(
-            learning_rate,
-            *config.betas,
-            weight_decay=config.weight_decay,
-            mask=param_decay_mask,
-        ),
-        # affine(
-        #     learning_rate=learning_rate,
-        #     preconditioner_update_probability=1.0,
-        #     b1=config.betas[0],
-        #     b2=config.betas[1],
-        #     nesterov=True,
-        #     update_global_norm_clip=None,
-        #     update_elementwise_clip=False,
-        #     weight_decay=config.weight_decay,
-        #     mask=param_decay_mask,
-        #     max_size_triangular=0,
-        #     max_skew_triangular=0,
-        #     step_normalizer_order="2nd",
-        #     precond_lr=0.01,
-        #     precond_init_scale=1.0,
-        #     seed=None,
-        #     mu_dtype=jnp.bfloat16,
-        #     precision="tensorfloat32",
-        # ),
-        optax.apply_every(config.gradient_accumulation_steps),
-    )
+    optimizer = []
+    optimizer.append(optax.clip_by_global_norm(config.optimizer.grad_clip))
+    print("using optimizer", config.optimizer.type)
+    if config.optimizer.type in ["adam", "adamw"]:
+        optimizer.append(
+            optax.adamw(
+                learning_rate,
+                *config.optimizer.betas,
+                weight_decay=config.optimizer.weight_decay,
+                mask=param_decay_mask,
+                mu_dtype=jnp.bfloat16,
+            )
+        )
+    elif config.optimizer.type in ["psgd_affine", "affine"]:
+        optimizer.append(
+            affine(
+                learning_rate=learning_rate,
+                preconditioner_update_probability=config.optimizer.preconditioner_update_probability,
+                b1=config.optimizer.betas[0],
+                b2=config.optimizer.betas[1] if config.optimizer.adaptive else None,
+                nesterov=False,
+                update_global_norm_clip=config.optimizer.update_global_norm_clip,
+                update_elementwise_clip=config.optimizer.update_elementwise_clip,
+                weight_decay=config.optimizer.weight_decay,
+                mask=param_decay_mask,
+                max_size_triangular=config.optimizer.max_size_triangular,
+                max_skew_triangular=config.optimizer.max_skew_triangular,
+                step_normalizer_order="2nd",
+                precond_lr=config.optimizer.precond_lr,
+                precond_init_scale=config.optimizer.precond_init_scale,
+                seed=None,
+                mu_dtype=jnp.bfloat16,
+                precision="tensorfloat32",
+            )
+        )
+    else:
+        raise ValueError("Unknown optimizer type")
+
+    optimizer.append(optax.apply_every(config.optimizer.gradient_accumulation_steps))
+
+    optimizer = optax.chain(*optimizer)
 
     train_state = TrainState.create(
         apply_fn=model.__call__, params=params, tx=optimizer
@@ -297,13 +320,13 @@ def get_default_config() -> TrainConfig:
 
 
 if __name__ == "__main__":
-    config = tyro.cli(TrainConfig, default=get_default_config())
+    config = tyro.cli(TrainConfig, default=get_default_config(), use_underscores=True)
 
     if config.wandb is not None and jax.process_index() == 0:
         wandb.init(**asdict(config.wandb))
         wandb.config.update(asdict(config))
 
-    block_size = config.model.block_size
+    block_size = config.model.n_positions
 
     # ===== datasets =====
     train_ds = get_dataset(
@@ -325,23 +348,21 @@ if __name__ == "__main__":
     keys_dropout = jax.random.split(key_dropout, jax.local_device_count())
 
     # ===== learning rate schedule =====
-    learning_rate = optax.join_schedules(
+    optimizer = optax.join_schedules(
         schedules=[
             optax.linear_schedule(
-                config.learning_rate.init_value,
-                config.learning_rate.peak_value,
-                config.learning_rate.warmup_steps,
+                0.0, config.optimizer.learning_rate, config.optimizer.warmup_steps
             ),
             optax.linear_schedule(
-                config.learning_rate.peak_value,
-                config.learning_rate.end_value,
-                config.learning_rate.decay_steps - config.learning_rate.warmup_steps,
+                config.optimizer.learning_rate,
+                0.0,
+                config.train_steps - config.optimizer.warmup_steps,
             ),
         ],
-        boundaries=[config.learning_rate.warmup_steps],
+        boundaries=[config.optimizer.warmup_steps],
     )
 
-    train_state = init_train_state(key_params, config, learning_rate)
+    train_state = init_train_state(key_params, config, optimizer)
 
     num_params = count_params(train_state.params)
     if jax.process_index() == 0:
@@ -379,6 +400,7 @@ if __name__ == "__main__":
     data, labels, lengths = prepare_hellaswag(config)
 
     train_losses = []
+    print("starting training")
     for step in range(step, config.train_steps):
         tokens = next(train_iter)
         loss, train_state = train_step(train_state, tokens, keys_dropout)
@@ -424,11 +446,7 @@ if __name__ == "__main__":
                         "train_loss": train_loss,
                         "val_loss": val_loss,
                         "hellaswag_acc": hellaswag_acc,
-                        "lr": (
-                            learning_rate(step)
-                            if callable(learning_rate)
-                            else learning_rate
-                        ),
+                        "lr": (optimizer(step) if callable(optimizer) else optimizer),
                         "step": step,
                         "block": step * config.batch_size * jax.device_count(),
                         "tokens": step
