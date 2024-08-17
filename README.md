@@ -30,7 +30,7 @@ conda activate gpt
 
 Clone gpt-jax
 ```shell
-git clone https://github.com/jenkspt/gpt-jax.git
+git clone https://github.com/evanatyourservice/gpt-jax.git
 cd gpt-jax
 ```
 

@@ -30,6 +30,9 @@ from optimizers.psgd_affine import affine
 
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+wandb.require("core")
+tf.config.experimental.set_visible_devices([], "GPU")
+tf.config.experimental.set_visible_devices([], "TPU")
 
 
 @dataclass(frozen=True)
@@ -265,7 +268,7 @@ def init_train_state(key, config: TrainConfig, learning_rate) -> TrainState:
     model_config = transformers.GPT2Config(**asdict(config.model))
     model = transformers.FlaxAutoModelForCausalLM.from_config(model_config)
     params = model.params
-    # pprint(params)
+    pprint(params, indent=2, width=120, compact=True)
 
     optimizer = []
     optimizer.append(optax.clip_by_global_norm(config.optimizer.grad_clip))
@@ -415,6 +418,22 @@ if __name__ == "__main__":
         )
         train_losses.append(loss[0].item())
 
+        if (config.wandb is not None) and (jax.process_index() == 0) and step % 10 == 0:
+            train_loss = np.mean(train_losses)
+            wandb.log(
+                {
+                    "train_loss": train_loss,
+                    "lr": (optimizer(step) if callable(optimizer) else optimizer),
+                    "tokens": step
+                    * config.batch_size
+                    * jax.device_count()
+                    * block_size,
+                },
+                step=step,
+            )
+
+            train_losses = []
+
         if step % config.eval_interval == 0 and step > 0:
             val_losses = []
             for _ in range(config.eval_steps):
@@ -423,14 +442,13 @@ if __name__ == "__main__":
                 val_losses.append(loss[0].item())
 
             val_loss = np.mean(val_losses)
-            train_loss = np.mean(train_losses)
 
             # hellaswag
             hellaswag_acc = eval_hellaswag(config, train_state, data, labels, lengths)
 
             print(
-                f"step: {step}, train_loss: {train_loss:.4f}, "
-                f"val_loss: {val_loss:.4f}, hellaswag_acc: {hellaswag_acc:.4f}"
+                f"step: {step}, val_loss: {val_loss:.4f}, "
+                f"hellaswag_acc: {hellaswag_acc:.4f}"
             )
 
             if config.eval_only:
@@ -451,19 +469,5 @@ if __name__ == "__main__":
 
             if (config.wandb is not None) and (jax.process_index() == 0):
                 wandb.log(
-                    {
-                        "train_loss": train_loss,
-                        "val_loss": val_loss,
-                        "hellaswag_acc": hellaswag_acc,
-                        "lr": (optimizer(step) if callable(optimizer) else optimizer),
-                        "step": step,
-                        "block": step * config.batch_size * jax.device_count(),
-                        "tokens": step
-                        * config.batch_size
-                        * jax.device_count()
-                        * block_size,
-                    },
-                    step=step,
+                    {"val_loss": val_loss, "hellaswag_acc": hellaswag_acc}, step=step
                 )
-
-            train_losses = []
