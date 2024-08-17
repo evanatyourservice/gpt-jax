@@ -10,7 +10,6 @@ python3 train.py \
     --out_dir=gs://uscentral1stuff/gpt_models/gpt_small/$EXPERIMENT \
     --train_pattern=gs://uscentral1stuff/openwebtext/train_??.tfrecord \
     --val_pattern=gs://uscentral1stuff/openwebtext/val_??.tfrecord \
-    --bfloat16_compute \
     --optimizer.type=affine \
     --optimizer.weight_decay=0.01 \
     --optimizer.grad_clip=10.0 \
