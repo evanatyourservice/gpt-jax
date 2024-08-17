@@ -17,9 +17,9 @@ python3 train.py \
     --optimizer.weight_decay=0.01 \
     --optimizer.grad_clip=10.0 \
     --optimizer.update_global_norm_clip=5000.0 \
-    --optimizer.update_elementwise_clip=True \
+    --optimizer.update_elementwise_clip \
     --optimizer.max_size_triangular=0 \
     --optimizer.max_skew_triangular=0 \
     --optimizer.precond_lr=1.0 \
     --optimizer.precond_init_scale=1.0 \
-    --optimizer.adaptive=True
+    --optimizer.adaptive

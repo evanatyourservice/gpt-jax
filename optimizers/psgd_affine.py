@@ -67,6 +67,11 @@ def scale_by_affine(
     def init_fn(params):
         key = seed if seed is not None else jax.random.PRNGKey(36)
 
+        if update_global_norm_clip is not None:
+            print("PSGD: Using global norm clipping.")
+        if update_elementwise_clip:
+            print("PSGD: Using elementwise clipping.")
+
         # momentum
         mu = None
         if b1 > 0:
