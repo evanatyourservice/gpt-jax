@@ -391,7 +391,7 @@ if __name__ == "__main__":
             print(val_loss)
 
             # hellaswag
-            hellaswag_acc = eval_hellaswag(train_state, data, labels, lengths)
+            hellaswag_acc = eval_hellaswag(config, train_state, data, labels, lengths)
             print(hellaswag_acc)
 
             if step > 0:
