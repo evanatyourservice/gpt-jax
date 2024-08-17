@@ -15,9 +15,9 @@ python3 train.py \
     --model.n_head=8 \
     --model.n_layer=8 \
     --model.n_inner=2048 \
-    --optimizer.type=adamw \
-    --optimizer.weight_decay=0.03 \
-    --optimizer.grad_clip=1.0 \
+    --optimizer.type=affine \
+    --optimizer.weight_decay=0.01 \
+    --optimizer.grad_clip=10.0 \
     --optimizer.preconditioner_update_probability=1.0 \
     --optimizer.update_global_norm_clip=5000.0 \
     --optimizer.update_elementwise_clip \
