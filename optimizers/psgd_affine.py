@@ -91,7 +91,9 @@ def scale_by_affine(
         ]
 
         # initial state
-        return PSGDAffineState(count=jnp.zeros([], jnp.int32), key=key, mu=mu, nu=nu, Qs=Qs)
+        return PSGDAffineState(
+            count=jnp.zeros([], jnp.int32), key=key, mu=mu, nu=nu, Qs=Qs
+        )
 
     def update_fn(
         updates: base.Updates,
@@ -219,7 +221,6 @@ def scale_by_affine(
         else:
             nu = None
             hvp_in = Hvp
-
 
         key, Qs = jax.lax.cond(
             update_preconditioner,

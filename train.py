@@ -78,7 +78,7 @@ class WandbConfig:
 
 @dataclass(frozen=True)
 class OptimizerConfig:
-    type: str = "psgd_affine"
+    type: str = "adamw"
     learning_rate: float = 0.001
     warmup_steps: int = 1000
     weight_decay: float = 0.1
