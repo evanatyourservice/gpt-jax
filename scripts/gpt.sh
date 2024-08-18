@@ -13,10 +13,10 @@ python3 train.py \
     --optimizer.type=affine \
     --optimizer.weight_decay=0.01 \
     --optimizer.grad_clip=1.0 \
-    --optimizer.preconditioner_update_probability=0.5 \
+    --optimizer.preconditioner_update_probability=1.0 \
     --optimizer.update_global_norm_clip=10000.0 \
     --optimizer.update_elementwise_clip \
     --optimizer.max_size_triangular=1000000000 \
     --optimizer.max_skew_triangular=1 \
-    --optimizer.precond_lr=0.3 \
+    --optimizer.precond_lr=0.2 \
     --optimizer.precond_init_scale=1.0
