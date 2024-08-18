@@ -222,6 +222,14 @@ def scale_by_affine(
             nu = None
             hvp_in = Hvp
 
+        # momentum
+        mu = None
+        if state.mu is not None:
+            updates, mu = apply_momentum(updates, state.mu, count_inc, b1, nesterov)
+
+        # preconditioning momentum update
+        hvp_in = updates
+
         key, Qs = jax.lax.cond(
             update_preconditioner,
             _update_precond,
@@ -231,11 +239,6 @@ def scale_by_affine(
             hvp_in,
             vector,
         )
-
-        # momentum
-        mu = None
-        if state.mu is not None:
-            updates, mu = apply_momentum(updates, state.mu, count_inc, b1, nesterov)
 
         # preconditioning
         flat_updates = [

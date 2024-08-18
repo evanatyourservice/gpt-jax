@@ -94,7 +94,7 @@ class OptimizerConfig:
     max_skew_triangular: int = 0
     precond_lr: float = 1.0
     precond_init_scale: float = 1.0
-    adaptive: bool = True
+    adaptive: bool = False
 
 
 @dataclass(frozen=True)
@@ -330,6 +330,10 @@ def get_default_config() -> TrainConfig:
 
 if __name__ == "__main__":
     config = tyro.cli(TrainConfig, default=get_default_config(), use_underscores=True)
+
+    # set seeds
+    np.random.seed(config.seed)
+    tf.random.set_seed(config.seed)
 
     if config.wandb is not None and jax.process_index() == 0:
         wandb.init(**asdict(config.wandb))
