@@ -24,7 +24,7 @@ rm -rf ~/miniconda3/miniconda.sh
 
 Restart shell and create a new conda environment
 ```shell
-conda create -n gpt python=3.9 -y
+conda create -n gpt python=3.11 -y
 conda activate gpt
 ```
 
