@@ -20,6 +20,8 @@ bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3
 rm -rf ~/miniconda3/miniconda.sh
 ~/miniconda3/bin/conda init bash
 ~/miniconda3/bin/conda init zsh
+source ~/.bashrc
+source ~/.zshrc
 ```
 
 Restart shell and create a new conda environment
@@ -31,17 +33,16 @@ conda activate gpt
 Clone gpt-jax
 ```shell
 git clone https://github.com/evanatyourservice/gpt-jax.git
-cd gpt-jax
 ```
 
 Install python dependencies TPU
 ```shell
-pip install -U pip && pip install -r requirements.txt && pip install --force-reinstall --upgrade --no-cache-dir "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html && pip install "numpy<2"
+cd gpt-jax && pip install -U pip && pip install -r requirements.txt && pip install --force-reinstall --upgrade --no-cache-dir 'jax[tpu]' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html && pip install 'numpy<2'
 ```
 
 Install python dependencies GPU
 ```shell
-pip install -U pip && pip install -r requirements.txt && pip install --force-reinstall --upgrade --no-cache-dir "jax[cuda12]" && pip install "numpy<2"
+cd gpt-jax && pip install -U pip && pip install -r requirements.txt && pip install --force-reinstall --upgrade --no-cache-dir 'jax[cuda12]' && pip install 'numpy<2'
 ```
 
 Prepare data
