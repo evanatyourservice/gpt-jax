@@ -102,6 +102,7 @@ def prepare_hellaswag(config):
     ds = tf.data.Dataset.from_tensor_slices((all_data, all_labels, all_lengths))
     ds = ds.shard(jax.process_count(), jax.process_index())
     ds = ds.repeat()
+    ds = ds.shuffle(1000)
     ds = ds.batch(
         max(config.batch_size // 4, 1), drop_remainder=True
     )  # (b, 4, block_size)
