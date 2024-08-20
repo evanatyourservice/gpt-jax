@@ -67,7 +67,7 @@ def prepare_hellaswag(config):
     all_lengths = []
     with open("data/hellaswag_val.jsonl", "r") as f:
         # iterate over lines and tokenize
-        for line in tqdm(f, total=10000):
+        for line in tqdm(f, total=10042):
             item = json.loads(line)
             context = item["ctx"]
             endings = item["endings"]
