@@ -22,9 +22,7 @@ def get_dataset(
     file_ds = file_ds.shard(jax.process_count(), jax.process_index())
     file_ds = file_ds.repeat()
 
-    ds = file_ds.interleave(
-        tf.data.TFRecordDataset, cycle_length=8, num_parallel_calls=tf.data.AUTOTUNE
-    )
+    ds = tf.data.TFRecordDataset(file_ds, num_parallel_reads=tf.data.AUTOTUNE)
 
     # each element of the dataset is a tokenized string
     feature_description = {
