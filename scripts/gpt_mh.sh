@@ -1,4 +1,7 @@
 #!/bin/bash
+# usage: bash scripts/gpt_mh.sh <wandb_api_key>
+
+WANDB_API_KEY=$1
 
 gcloud compute tpus tpu-vm ssh --zone "us-central2-b" "LLaMA" --project "my-phd-research-o" \
 --worker=all --command="
