@@ -17,19 +17,17 @@ class PSGDAffineState(NamedTuple):
     count: jax.Array
     key: PRNGKey
     mu: Optional[base.Updates]
-    nu: Optional[base.Updates]
     Qs: List[List[jax.Array]]
 
 
 def scale_by_affine(
-    preconditioner_update_probability: float = 1.0,
+    preconditioner_update_probability: Union[float, Callable[[int], float]] = 1.0,
     b1: float = 0.9,
-    b2: Optional[float] = None,
     nesterov: bool = False,
     update_global_norm_clip: Optional[float] = None,
     update_elementwise_clip: bool = False,
-    max_size_triangular: int = 4096,
-    max_skew_triangular: int = 128,
+    max_size_triangular: int = 0,
+    max_skew_triangular: int = 0,
     step_normalizer_order: str = "2nd",
     precond_lr: Union[float, Callable[[int], float]] = 0.1,
     precond_init_scale: Optional[float] = None,
@@ -78,11 +76,6 @@ def scale_by_affine(
             print("PSGD: Using momentum.")
             mu = otu.tree_zeros_like(params, mu_dtype)
 
-        nu = None
-        if b2 is not None:
-            print("PSGD: Using second momentum.")
-            nu = otu.tree_zeros_like(params, mu_dtype)
-
         # preconditioners
         affine_reshapers = [_shape_as_matrix(x) for x in jax.tree.leaves(params)]
         Qs = [
@@ -91,9 +84,7 @@ def scale_by_affine(
         ]
 
         # initial state
-        return PSGDAffineState(
-            count=jnp.zeros([], jnp.int32), key=key, mu=mu, nu=nu, Qs=Qs
-        )
+        return PSGDAffineState(count=jnp.zeros([], jnp.int32), key=key, mu=mu, Qs=Qs)
 
     def update_fn(
         updates: base.Updates,
@@ -209,19 +200,6 @@ def scale_by_affine(
                 state.count < 2,
             )
 
-            if b2 is not None:
-                # ema of grads to pass into preconditioner
-                nu = otu.tree_update_moment(updates, state.nu, b2, 1)
-                nu_hat = otu.tree_bias_correction(nu, b2, count_inc)
-                hvp_in = nu_hat
-            else:
-                nu = None
-                # use grads as h
-                hvp_in = updates
-        else:
-            nu = None
-            hvp_in = Hvp
-
         # momentum
         mu = None
         if state.mu is not None:
@@ -260,24 +238,23 @@ def scale_by_affine(
             updates = jax.tree.map(lambda x: jnp.clip(x, -1.0, 1.0), updates)
 
         mu = otu.tree_cast(mu, mu_dtype)
-        state = PSGDAffineState(count=count_inc, key=key, mu=mu, nu=nu, Qs=Qs)
+        state = PSGDAffineState(count=count_inc, key=key, mu=mu, Qs=Qs)
         return updates, state
 
     return base.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
 def affine(
-    learning_rate: Union[float, Callable[[int], float]] = 0.01,
+    learning_rate: Union[float, Callable[[int], float]] = 0.001,
     preconditioner_update_probability: float = 1.0,
     b1: float = 0.9,
-    b2: Optional[float] = None,
     nesterov: bool = False,
     update_global_norm_clip: Optional[float] = None,
     update_elementwise_clip: bool = False,
     weight_decay: float = 0.0,
     mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None,
-    max_size_triangular: int = 4096,
-    max_skew_triangular: int = 128,
+    max_size_triangular: int = 0,
+    max_skew_triangular: int = 0,
     step_normalizer_order: str = "2nd",
     precond_lr: Union[float, Callable[[int], float]] = 0.1,
     precond_init_scale: Optional[float] = None,
@@ -317,7 +294,6 @@ def affine(
         scale_by_affine(
             preconditioner_update_probability=preconditioner_update_probability,
             b1=b1,
-            b2=b2,
             nesterov=nesterov,
             update_global_norm_clip=update_global_norm_clip,
             update_elementwise_clip=update_elementwise_clip,

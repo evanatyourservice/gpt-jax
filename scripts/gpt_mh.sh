@@ -19,7 +19,7 @@ python3 train.py \
     --train_pattern=gs://uscentral1stuff/openwebtext/train_??.tfrecord \
     --val_pattern=gs://uscentral1stuff/openwebtext/val_??.tfrecord \
     --optimizer.type=affine \
-    --optimizer.weight_decay=0.01 \
+    --optimizer.weight_decay=0.1 \
     --optimizer.grad_clip=1.0 \
     --optimizer.preconditioner_update_probability=0.5 \
     --optimizer.update_global_norm_clip=10000.0 \

@@ -40,22 +40,22 @@ class GPT2Config:
     n_head: int = 12
     n_inner: int = None
     activation_function: str = "gelu_new"
-    resid_pdrop: float = 0.1
-    embd_pdrop: float = 0.1
-    attn_pdrop: float = 0.1
+    resid_pdrop: float = 0.0
+    embd_pdrop: float = 0.0
+    attn_pdrop: float = 0.0
     layer_norm_epsilon: float = 0.00001
-    initializer_range: float = 0.02
+    initializer_range: float = 0.01
     summary_type: str = "cls_index"
     summary_use_proj: bool = True
     summary_activation: str = None
     summary_proj_to_labels: bool = True
-    summary_first_dropout: float = 0.1
+    summary_first_dropout: float = 0.0
     scale_attn_weights: bool = True
-    use_cache: bool = True
+    use_cache: bool = False
     bos_token_id: int = 50256
     eos_token_id: int = 50256
-    scale_attn_by_inverse_layer_idx: bool = False
-    reorder_and_upcast_attn: bool = False
+    scale_attn_by_inverse_layer_idx: bool = True
+    reorder_and_upcast_attn: bool = True
 
 
 @dataclass(frozen=True)
@@ -80,7 +80,7 @@ class OptimizerConfig:
     type: str = "adamw"
     learning_rate: float = 0.001
     warmup_steps: int = 1000
-    weight_decay: float = 0.1
+    weight_decay: float = 0.01
     grad_clip: float = 1.0
     gradient_accumulation_steps: int = 1
     betas: Tuple[float, float] = (0.9, 0.95)
@@ -89,9 +89,8 @@ class OptimizerConfig:
     update_elementwise_clip: bool = False
     max_size_triangular: int = 0
     max_skew_triangular: int = 0
-    precond_lr: float = 1.0
+    precond_lr: float = 0.1
     precond_init_scale: float = 1.0
-    adaptive: bool = False
 
 
 @dataclass(frozen=True)
@@ -107,13 +106,13 @@ class TrainConfig:
         "owt_data/val_??.tfrecord"  # validation files glob pattern (can be gcs path)
     )
     shuffle_buffer_size: int = 128
-    eval_interval: int = 500
+    eval_interval: int = 250
     eval_steps: int = 16  # evaluate for this number of steps (per-device)
     hs_eval_steps: int = 16  # evaluate for this number of steps (per-device)
     eval_only: bool = False  # if True, script exits right after the first eval
     keep_checkpoints: int = 0  # number of historical checkpoints to keep
     batch_size: int = 16  # per-device batch size
-    train_steps: int = 50000  # total number of training iterations
+    train_steps: int = 100000  # total number of training iterations
     bfloat16_compute: bool = False  # use bfloat16 for compute
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)  # wandb logging
@@ -234,7 +233,6 @@ def init_train_state(key, config: TrainConfig, learning_rate) -> TrainState:
                 learning_rate=learning_rate,
                 preconditioner_update_probability=config.optimizer.preconditioner_update_probability,
                 b1=config.optimizer.betas[0],
-                b2=config.optimizer.betas[1] if config.optimizer.adaptive else None,
                 nesterov=False,
                 update_global_norm_clip=config.optimizer.update_global_norm_clip,
                 update_elementwise_clip=config.optimizer.update_elementwise_clip,
@@ -277,6 +275,9 @@ def get_default_config() -> TrainConfig:
 if __name__ == "__main__":
     config = tyro.cli(TrainConfig, default=get_default_config(), use_underscores=True)
 
+    print(f"Number of JAX devices: {jax.device_count()}")
+    print(f"Number of JAX processes: {jax.process_count()}")
+
     # set seeds
     np.random.seed(config.seed)
     tf.random.set_seed(config.seed)
@@ -289,14 +290,9 @@ if __name__ == "__main__":
 
     # ===== datasets =====
     train_ds = get_dataset(
-        config.train_pattern,
-        config.batch_size,
-        block_size,
-        config.shuffle_buffer_size,
-        seed=config.seed,
+        config.train_pattern, config.batch_size, block_size, config.shuffle_buffer_size
     )
     train_ds = flax.jax_utils.prefetch_to_device(train_ds, 1)
-
     val_ds = get_dataset(config.val_pattern, config.batch_size, block_size)
     hellaswag_ds = prepare_hellaswag(config)
 

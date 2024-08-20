@@ -17,15 +17,15 @@ def get_dataset(
     batch_size: int = 8,
     block_size: int = 1024,
     shuffle_buffer_size: Optional[int] = None,
-    repeat: Optional[int] = None,
-    seed: Optional[int] = None,
 ) -> tf.data.Dataset.as_numpy_iterator:
-
-    tf.random.set_seed(seed)
-
-    file_ds = tf.data.Dataset.list_files(pattern, shuffle=bool(shuffle_buffer_size))
+    file_ds = tf.data.Dataset.list_files(pattern, shuffle=False)
     file_ds = file_ds.shard(jax.process_count(), jax.process_index())
-    ds = tf.data.TFRecordDataset(file_ds, num_parallel_reads=tf.data.AUTOTUNE)
+    file_ds = file_ds.repeat()
+
+    ds = file_ds.interleave(
+        tf.data.TFRecordDataset, cycle_length=8, num_parallel_calls=tf.data.AUTOTUNE
+    )
+
     # each element of the dataset is a tokenized string
     feature_description = {
         "ids": tf.io.FixedLenFeature([], tf.string, default_value="")
@@ -36,7 +36,6 @@ def get_dataset(
         return tf.io.decode_raw(example["ids"], tf.uint16)
 
     ds = ds.map(parse_example, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.repeat(repeat)
 
     # here we shuffle each group of tokens and then unbatch into a single
     # contiguous sequence of ids, we then chunk the sequence into blocks
@@ -45,7 +44,7 @@ def get_dataset(
 
     ds = ds.unbatch().batch(block_size + 1, drop_remainder=True)
 
-    # each block is then shuffled and then batched
+    # blocks are then shuffled and batched
     if shuffle_buffer_size is not None:
         ds = ds.shuffle(shuffle_buffer_size)
 
@@ -60,6 +59,8 @@ def get_dataset(
 def prepare_hellaswag(config):
     """Read file and tokenize the hellaswag dataset."""
     print("preparing hellaswag")
+
+    block_size = config.model.n_positions
     enc = tiktoken.get_encoding("gpt2")
 
     all_data = []
@@ -77,12 +78,11 @@ def prepare_hellaswag(config):
             for ending in endings:
                 input_text = context + " " + ending
                 input_ids = enc.encode_ordinary(input_text)
-                if len(input_ids) > config.model.n_positions:
+                # +1 for [1:] input [:-1] target shift
+                if len(input_ids) > block_size + 1:
                     continue
                 lens.append(len(input_ids))
-                input_ids = np.pad(
-                    input_ids, (0, config.model.n_positions - len(input_ids))
-                )
+                input_ids = np.pad(input_ids, (0, block_size + 1 - len(input_ids)))
                 to_concat.append(input_ids)
             all_data.append(np.array(to_concat))  # (4, block_size)
             all_labels.append(correct_end)  # scalar
