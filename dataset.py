@@ -6,7 +6,6 @@ import tensorflow as tf
 import tiktoken
 from tqdm import tqdm
 
-from train import TrainConfig
 
 OPTIONS = tf.data.Options()
 OPTIONS.deterministic = True
@@ -58,7 +57,7 @@ def get_dataset(
     return ds
 
 
-def prepare_hellaswag(config: TrainConfig):
+def prepare_hellaswag(config):
     """Read file and tokenize the hellaswag dataset."""
     print("preparing hellaswag")
     enc = tiktoken.get_encoding("gpt2")
