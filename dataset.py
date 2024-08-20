@@ -1,7 +1,12 @@
+import json
 from typing import Optional
 import jax
+import numpy as np
 import tensorflow as tf
+import tiktoken
+from tqdm import tqdm
 
+from train import TrainConfig
 
 OPTIONS = tf.data.Options()
 OPTIONS.deterministic = True
@@ -50,4 +55,52 @@ def get_dataset(
     ds = ds.with_options(OPTIONS)
     ds = ds.prefetch(5)
     ds = ds.as_numpy_iterator()
+    return ds
+
+
+def prepare_hellaswag(config: TrainConfig):
+    """Read file and tokenize the hellaswag dataset."""
+    print("preparing hellaswag")
+    enc = tiktoken.get_encoding("gpt2")
+
+    all_data = []
+    all_labels = []
+    all_lengths = []
+    with open("data/hellaswag_val.jsonl", "r") as f:
+        # iterate over lines and tokenize
+        for line in tqdm(f, total=10000):
+            item = json.loads(line)
+            context = item["ctx"]
+            endings = item["endings"]
+            correct_end = item["label"]
+            to_concat = []
+            lens = []
+            for ending in endings:
+                input_text = context + " " + ending
+                input_ids = enc.encode_ordinary(input_text)
+                if len(input_ids) > config.model.n_positions:
+                    continue
+                lens.append(len(input_ids))
+                input_ids = np.pad(
+                    input_ids, (0, config.model.n_positions - len(input_ids))
+                )
+                to_concat.append(input_ids)
+            all_data.append(np.array(to_concat))  # (4, block_size)
+            all_labels.append(correct_end)  # scalar
+            all_lengths.append(np.array(lens))  # (4,)
+
+    all_data = np.array(all_data)
+    all_labels = np.array(all_labels)
+    all_lengths = np.array(all_lengths)
+
+    ds = tf.data.Dataset.from_tensor_slices((all_data, all_labels, all_lengths))
+    ds = ds.shard(jax.process_count(), jax.process_index())
+    ds = ds.repeat()
+    ds = ds.batch(
+        max(config.batch_size // 4, 1), drop_remainder=True
+    )  # (b, 4, block_size)
+    ds = ds.batch(jax.local_device_count(), drop_remainder=True)
+    ds = ds.prefetch(5)
+    ds = ds.as_numpy_iterator()
+
     return ds

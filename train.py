@@ -1,4 +1,3 @@
-import json
 from pprint import pprint
 from typing import Tuple, Optional
 from dataclasses import dataclass, field, asdict
@@ -8,8 +7,6 @@ import logging
 import sys
 
 import numpy as np
-import tiktoken
-from tqdm import tqdm
 
 import wandb
 import tyro
@@ -24,7 +21,7 @@ import optax
 import tensorflow as tf
 import transformers
 
-from dataset import get_dataset
+from dataset import get_dataset, prepare_hellaswag
 from optimizers.psgd_affine import affine
 
 
@@ -168,83 +165,32 @@ def eval_step(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
     return loss
 
 
-@partial(jax.pmap, axis_name="batch")
-def eval_step_raw(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
+def eval_step_unreduced(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
     X, Y = tokens[:, :-1], tokens[:, 1:]
     logits = state.apply_fn(X, params=state.params, train=False)[0]
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y)
     return loss
 
 
-def prepare_hellaswag(config: TrainConfig):
-    """Read file and tokenize the hellaswag dataset."""
-    print("preparing hellaswag")
-    enc = tiktoken.get_encoding("gpt2")
-
-    all_data = []
-    all_labels = []
-    all_lengths = []
-    with open("data/hellaswag_val.jsonl", "r") as f:
-        # iterate over lines and tokenize
-        for line in tqdm(f, total=10042):
-            item = json.loads(line)
-            context = item["ctx"]
-            endings = item["endings"]
-            correct_end = item["label"]
-            to_concat = []
-            lens = []
-            for ending in endings:
-                input_text = context + " " + ending
-                input_ids = enc.encode_ordinary(input_text)
-                if len(input_ids) > config.model.n_positions:
-                    continue
-                lens.append(len(input_ids))
-                input_ids = np.pad(
-                    input_ids, (0, config.model.n_positions - len(input_ids))
-                )
-                to_concat.append(input_ids)
-            all_data.append(np.array(to_concat))
-            all_labels.append(correct_end)
-            all_lengths.append(np.array(lens))
-
-    # cut lists to divisible by n devices
-    n_devices = jax.device_count()
-    n_data = len(all_data)
-    n_data -= n_data % n_devices
-    all_data = all_data[:n_data]
-    all_labels = all_labels[:n_data]
-    all_lengths = all_lengths[:n_data]
-
-    # batch to shape (-1, n_devices, 4, block_size)
-    all_data = np.array(all_data).reshape(-1, n_devices, 4, config.model.n_positions)
-    all_labels = np.array(all_labels).reshape(-1, n_devices)
-    all_lengths = np.array(all_lengths).reshape(-1, n_devices, 4)
-    return all_data, all_labels, all_lengths
-
-
-def eval_hellaswag(config, state, data, labels, lengths):
+@partial(jax.pmap, axis_name="batch")
+def eval_hellaswag(state: TrainState, data, labels, lengths):
     """Evaluate the hellaswag dataset."""
-    correct = 0
-    total = 0
-    # select n random examples
-    n = config.hs_eval_steps
-    data = data[np.random.choice(data.shape[0], n, replace=False)]
-    labels = labels[np.random.choice(labels.shape[0], n, replace=False)]
-    lengths = lengths[np.random.choice(lengths.shape[0], n, replace=False)]
-    for i in range(n):
-        batch = data[i]  # (n_devices, 4, block_size)
-        batch_labels = labels[i]  # (n_devices,)
-        batch_lengths = lengths[i]  # (n_devices, 4)
-        losses = eval_step_raw(state, batch)  # (n_devices, 4, block_size)
-        losses = np.array(jax.device_get(losses))
-        for loss_i, label_i, length_i in zip(losses, batch_labels, batch_lengths):
-            losses = [l[:length] for l, length in zip(loss_i, length_i)]  # (4, length)
-            losses = [l.mean() for l in losses]  # (4,)
-            predicted_end = np.argmin(losses)
-            if predicted_end == label_i:
-                correct += 1
-            total += 1
-    return correct / total
+    # data comes in shape (b, 4, block_size)
+    # labels comes in shape (b,)
+    # lengths comes in shape (b, 4)
+    batch = jnp.reshape(data, (-1, data.shape[-1]))
+    losses = eval_step_unreduced(state, batch)
+    losses = jax.vmap(jnp.cumsum)(losses)
+    lengths = jnp.reshape(lengths, (-1,))
+    losses = jax.vmap(
+        lambda x, l: jax.lax.dynamic_index_in_dim(x, l - 1, axis=0, keepdims=False)
+    )(losses, lengths)
+    choices = jnp.argmin(jnp.reshape(losses, (data.shape[0], data.shape[1])), axis=1)
+    correct = jnp.sum(choices == labels)
+    accuracy = correct / data.shape[0]
+
+    accuracy = jax.lax.pmean(accuracy, axis_name="batch")
+    return accuracy
 
 
 def count_params(params) -> int:
@@ -352,6 +298,7 @@ if __name__ == "__main__":
     train_ds = flax.jax_utils.prefetch_to_device(train_ds, 1)
 
     val_ds = get_dataset(config.val_pattern, config.batch_size, block_size)
+    hellaswag_ds = prepare_hellaswag(config)
 
     # =====  init parameters ============
     key = jax.random.PRNGKey(config.seed)
@@ -449,7 +396,8 @@ if __name__ == "__main__":
             val_loss = np.mean(val_losses)
 
             # hellaswag
-            hellaswag_acc = eval_hellaswag(config, train_state, data, labels, lengths)
+            hs_batch = next(hellaswag_ds)
+            hellaswag_acc = eval_hellaswag(train_state, *hs_batch)[0].item()
 
             print(
                 f"step: {step}, val_loss: {val_loss:.4f}, "
