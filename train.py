@@ -183,7 +183,7 @@ def eval_hellaswag(state: TrainState, data, labels, lengths):
     losses = jax.vmap(jnp.cumsum)(losses)
     lengths = jnp.reshape(lengths, (-1,))
     losses = jax.vmap(
-        lambda x, l: jax.lax.dynamic_index_in_dim(x, l - 1, axis=0, keepdims=False)
+        lambda x, l: jax.lax.dynamic_index_in_dim(x, l - 2, axis=0, keepdims=False)
     )(losses, lengths)
     choices = jnp.argmin(jnp.reshape(losses, (data.shape[0], data.shape[1])), axis=1)
     correct = jnp.sum(choices == labels)
