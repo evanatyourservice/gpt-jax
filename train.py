@@ -358,9 +358,6 @@ if __name__ == "__main__":
     # replicate parameters to each device
     train_state = replicate(train_state)
 
-    # batch hellaswag dataset
-    data, labels, lengths = prepare_hellaswag(config)
-
     train_losses = []
     print("starting training")
     for step in range(step, config.train_steps):
