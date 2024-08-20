@@ -17,12 +17,21 @@ def get_dataset(
     batch_size: int = 8,
     block_size: int = 1024,
     shuffle_buffer_size: Optional[int] = None,
+    interleave_cycle_length: int = 1,
 ) -> tf.data.Dataset.as_numpy_iterator:
     file_ds = tf.data.Dataset.list_files(pattern, shuffle=False)
     file_ds = file_ds.shard(jax.process_count(), jax.process_index())
     file_ds = file_ds.repeat()
 
-    ds = tf.data.TFRecordDataset(file_ds, num_parallel_reads=tf.data.AUTOTUNE)
+    if interleave_cycle_length > 1:
+        ds = file_ds.interleave(
+            lambda x: tf.data.TFRecordDataset(x, num_parallel_reads=tf.data.AUTOTUNE),
+            cycle_length=interleave_cycle_length,
+            block_length=1,
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+    else:
+        ds = tf.data.TFRecordDataset(file_ds, num_parallel_reads=tf.data.AUTOTUNE)
 
     # each element of the dataset is a tokenized string
     feature_description = {

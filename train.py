@@ -290,7 +290,11 @@ if __name__ == "__main__":
 
     # ===== datasets =====
     train_ds = get_dataset(
-        config.train_pattern, config.batch_size, block_size, config.shuffle_buffer_size
+        config.train_pattern,
+        config.batch_size,
+        block_size,
+        config.shuffle_buffer_size,
+        interleave_cycle_length=max(1, 32 // jax.process_count()),
     )
     train_ds = flax.jax_utils.prefetch_to_device(train_ds, 1)
     val_ds = get_dataset(config.val_pattern, config.batch_size, block_size)
