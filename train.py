@@ -296,7 +296,8 @@ if __name__ == "__main__":
         config.shuffle_buffer_size,
         interleave_cycle_length=max(1, 32 // jax.process_count()),
     )
-    train_ds = flax.jax_utils.prefetch_to_device(train_ds, 1)
+    using_gpu = jax.devices()[0].platform == "gpu"
+    train_ds = flax.jax_utils.prefetch_to_device(train_ds, 2 if using_gpu else 1)
     val_ds = get_dataset(config.val_pattern, config.batch_size, block_size)
     hellaswag_ds = prepare_hellaswag(config)
 
