@@ -6,7 +6,7 @@ eval_steps: 16
 hs_eval_steps: 16
 eval_only: False
 keep_checkpoints: 0
-batch_size: 16
+batch_size: 256
 train_steps: 100000
 optimizer: !dataclass:OptimizerConfig
     type: "adamw"
