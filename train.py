@@ -254,7 +254,10 @@ def main(config: TrainConfig):
     )
     # hellaswag has 4 seqs per multiple choice problem
     hellaswag_ds = prepare_hellaswag(
-        max(config.batch_size // 4, jax.device_count()), block_size, devices_flat
+        max(config.batch_size // 4, jax.device_count()),
+        block_size,
+        devices_flat,
+        shuffle_buffer_size=10042 // jax.process_count(),
     )
 
     # ===== optimizer =====
