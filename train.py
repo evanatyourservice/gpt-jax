@@ -115,7 +115,6 @@ class TrainConfig:
     eval_interval: int = 250
     eval_steps: int = 16  # evaluate for this number of steps (per-device)
     hs_eval_steps: int = 16  # evaluate for this number of steps (per-device)
-    eval_only: bool = False  # if True, script exits right after the first eval
     keep_checkpoints: int = 0  # number of historical checkpoints to keep
     batch_size: int = 128
     train_steps: int = 100000  # total number of training iterations
@@ -253,10 +252,9 @@ def main(config: TrainConfig):
         block_size,
         interleave_cycle_length=max(1, 8 // jax.process_count()),
     )
+    # hellaswag has 4 seqs per multiple choice problem
     hellaswag_ds = prepare_hellaswag(
-        max(config.batch_size // 4, 1),  # hellaswag has 4 seqs per problem
-        block_size,
-        devices_flat,
+        max(config.batch_size // 4, jax.device_count()), block_size, devices_flat
     )
 
     # ===== optimizer =====
@@ -434,9 +432,6 @@ def main(config: TrainConfig):
                 f"step: {step}, val_loss: {val_loss:.4f}, "
                 f"hellaswag_acc: {hellaswag_acc:.4f}"
             )
-
-            if config.eval_only:
-                break
 
             if val_loss < best_val_loss and config.keep_checkpoints > 0:
                 best_val_loss = val_loss

@@ -80,7 +80,7 @@ def prepare_hellaswag(
     batch_size: int,
     block_size: int,
     flat_devices,
-    shuffle_buffer_size: Optional[int] = 1000,
+    shuffle_buffer_size: Optional[int] = 2000,
     tf_prefetch: int = 2,
     device_prefetch: int = 0,
 ):
