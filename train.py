@@ -110,14 +110,14 @@ class TrainConfig:
     val_pattern: str = (
         "owt_data/val_??.tfrecord"  # validation files glob pattern (can be gcs path)
     )
-    min_size_to_shard_mb: int = (4,)
+    min_size_to_shard_mb: int = 4
     shuffle_buffer_size: int = 128
     eval_interval: int = 250
     eval_steps: int = 16  # evaluate for this number of steps (per-device)
     hs_eval_steps: int = 16  # evaluate for this number of steps (per-device)
     eval_only: bool = False  # if True, script exits right after the first eval
     keep_checkpoints: int = 0  # number of historical checkpoints to keep
-    batch_size: int = 64
+    batch_size: int = 128
     train_steps: int = 100000  # total number of training iterations
     bfloat16_compute: bool = False  # use bfloat16 for compute
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
