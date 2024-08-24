@@ -3,7 +3,6 @@
 EXPERIMENT=run_$(date +%Y-%m-%d_%H-%M-%S)
 echo $EXPERIMENT
 
-export TF_CPP_MIN_LOG_LEVEL=3
 export GPT_CONFIG=config/gpt2.yaml  # base config
 
 python3 train.py \

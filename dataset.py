@@ -1,25 +1,31 @@
 import json
 from typing import Optional
-import jax
 import numpy as np
+from tqdm import tqdm
+
+import jax
 import tensorflow as tf
 import tiktoken
-from tqdm import tqdm
+
+from utils import make_fsarray_from_local_slice, prefetch_iterator, threadstart_iterator
 
 
 OPTIONS = tf.data.Options()
-OPTIONS.deterministic = True
+OPTIONS.deterministic = False
 OPTIONS.autotune.enabled = True
 
 
 def get_dataset(
     pattern: str,
-    batch_size: int = 8,
+    flat_devices,
+    batch_size: int,
     block_size: int = 1024,
-    shuffle_buffer_size: Optional[int] = None,
     interleave_cycle_length: int = 1,
+    shuffle_buffer_size: Optional[int] = None,
+    tf_prefetch: int = 5,
+    device_prefetch: int = 0,
 ) -> tf.data.Dataset.as_numpy_iterator:
-    file_ds = tf.data.Dataset.list_files(pattern, shuffle=False)
+    file_ds = tf.data.Dataset.list_files(pattern, shuffle=True)
     file_ds = file_ds.shard(jax.process_count(), jax.process_index())
     file_ds = file_ds.repeat()
 
@@ -55,15 +61,28 @@ def get_dataset(
     if shuffle_buffer_size is not None:
         ds = ds.shuffle(shuffle_buffer_size)
 
-    ds = ds.batch(batch_size, drop_remainder=True)
-    ds = ds.batch(jax.local_device_count(), drop_remainder=True)
+    ds = ds.batch(batch_size // jax.process_count(), drop_remainder=True)
     ds = ds.with_options(OPTIONS)
-    ds = ds.prefetch(5)
+    ds = ds.prefetch(tf_prefetch)
     ds = ds.as_numpy_iterator()
+    ds = iter(ds)
+    ds = threadstart_iterator(ds)
+    ds = (
+        jax.tree.map(lambda x: make_fsarray_from_local_slice(x, flat_devices), elem)
+        for elem in ds
+    )
+    if device_prefetch > 0:
+        ds = prefetch_iterator(ds, device_prefetch)
     return ds
 
 
-def prepare_hellaswag(config):
+def prepare_hellaswag(
+    config,
+    flat_devices,
+    shuffle_buffer_size: Optional[int] = 1000,
+    tf_prefetch: int = 2,
+    device_prefetch: int = 0,
+):
     """Read file and tokenize the hellaswag dataset."""
     print("preparing hellaswag")
 
@@ -102,12 +121,18 @@ def prepare_hellaswag(config):
     ds = tf.data.Dataset.from_tensor_slices((all_data, all_labels, all_lengths))
     ds = ds.shard(jax.process_count(), jax.process_index())
     ds = ds.repeat()
-    ds = ds.shuffle(1000)
-    ds = ds.batch(
-        max(config.batch_size // 4, 1), drop_remainder=True
-    )  # (b, 4, block_size)
-    ds = ds.batch(jax.local_device_count(), drop_remainder=True)
-    ds = ds.prefetch(5)
+    if shuffle_buffer_size is not None:
+        ds = ds.shuffle(shuffle_buffer_size)
+    ds = ds.batch(config.batch_size // jax.process_count(), drop_remainder=True)
+    ds = ds.with_options(OPTIONS)
+    ds = ds.prefetch(tf_prefetch)
     ds = ds.as_numpy_iterator()
-
+    ds = iter(ds)
+    ds = threadstart_iterator(ds)
+    ds = (
+        jax.tree.map(lambda x: make_fsarray_from_local_slice(x, flat_devices), elem)
+        for elem in ds
+    )
+    if device_prefetch > 0:
+        ds = prefetch_iterator(ds, device_prefetch)
     return ds

@@ -1,34 +1,39 @@
 from pprint import pprint
 from typing import Tuple, Optional
 from dataclasses import dataclass, field, asdict
-from functools import partial
 import os
-import logging
-import sys
-
 import numpy as np
-
 import wandb
 import tyro
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import mesh_utils
+from jax.sharding import Mesh, PartitionSpec as P
+import transformers
 import flax
 from flax.training import checkpoints
 from flax.training.train_state import TrainState
-from flax.jax_utils import replicate, unreplicate
 import optax
 import tensorflow as tf
-import transformers
 
 from dataset import get_dataset, prepare_hellaswag
 from optimizers.psgd_affine import affine
+from sharding import infer_sharding, fsdp_sharding
+from utils import reshard, write_note
 
 
-logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 wandb.require("core")
 tf.config.experimental.set_visible_devices([], "GPU")
 tf.config.experimental.set_visible_devices([], "TPU")
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+# Transfer guard will fail the program whenever that data between a host and
+# a device is transferred implicitly. This often catches subtle bugs that
+# cause slowdowns and memory fragmentation. Explicit transfers are done
+# with jax.device_put and jax.device_get.
+jax.config.update("jax_transfer_guard", "disallow")
+# Fixes design flaw in jax.random that may cause unnecessary d2d comms.
+jax.config.update("jax_threefry_partitionable", True)
 
 
 @dataclass(frozen=True)
@@ -105,13 +110,14 @@ class TrainConfig:
     val_pattern: str = (
         "owt_data/val_??.tfrecord"  # validation files glob pattern (can be gcs path)
     )
+    min_size_to_shard_mb: int = (4,)
     shuffle_buffer_size: int = 128
     eval_interval: int = 250
     eval_steps: int = 16  # evaluate for this number of steps (per-device)
     hs_eval_steps: int = 16  # evaluate for this number of steps (per-device)
     eval_only: bool = False  # if True, script exits right after the first eval
     keep_checkpoints: int = 0  # number of historical checkpoints to keep
-    batch_size: int = 16  # per-device batch size
+    batch_size: int = 64
     train_steps: int = 100000  # total number of training iterations
     bfloat16_compute: bool = False  # use bfloat16 for compute
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -120,9 +126,6 @@ class TrainConfig:
     remat: bool = False  # set to True to rematerialize gradients during backward pass
 
 
-@partial(
-    jax.pmap, axis_name="batch", donate_argnums=(0,), static_broadcasted_argnums=(3,)
-)
 def train_step(
     state: TrainState, tokens: jnp.ndarray, dropout_key, use_bfloat16: bool
 ) -> Tuple[jnp.ndarray, TrainState]:
@@ -146,21 +149,14 @@ def train_step(
         return loss
 
     loss, grads = jax.value_and_grad(loss_fn, has_aux=False)(state.params)
-
-    grads = jax.lax.pmean(grads, axis_name="batch")
-    loss = jax.lax.pmean(loss, axis_name="batch")
-
     new_state = state.apply_gradients(grads=grads)
-
     return loss, new_state
 
 
-@partial(jax.pmap, axis_name="batch")
 def eval_step(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
     X, Y = tokens[:, :-1], tokens[:, 1:]
     logits = state.apply_fn(X, params=state.params, train=False)[0]
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, Y).mean()
-    loss = jax.lax.pmean(loss, axis_name="batch")
     return loss
 
 
@@ -171,7 +167,6 @@ def eval_step_unreduced(state: TrainState, tokens: jnp.ndarray) -> jnp.ndarray:
     return loss
 
 
-@partial(jax.pmap, axis_name="batch")
 def eval_hellaswag(state: TrainState, data, labels, lengths):
     """Evaluate the hellaswag dataset."""
     # data comes in shape (b, 4, block_size)
@@ -187,8 +182,6 @@ def eval_hellaswag(state: TrainState, data, labels, lengths):
     choices = jnp.argmin(jnp.reshape(losses, (data.shape[0], data.shape[1])), axis=1)
     correct = jnp.sum(choices == labels)
     accuracy = correct / data.shape[0]
-
-    accuracy = jax.lax.pmean(accuracy, axis_name="batch")
     return accuracy
 
 
@@ -208,19 +201,83 @@ def param_decay_mask(params):
     return flax.traverse_util.unflatten_dict(flat_param_mask)
 
 
-def init_train_state(key, config: TrainConfig, learning_rate) -> TrainState:
-    model_config = transformers.GPT2Config(**asdict(config.model))
-    model = transformers.FlaxAutoModelForCausalLM.from_config(model_config)
-    params = model.params
-    pprint(jax.tree.map(lambda x: x.shape, params), indent=2, width=120, compact=True)
+def get_default_config() -> TrainConfig:
+    # use this file to set default values
+    path = os.environ.get("GPT_CONFIG", os.path.join("config", "gpt2.yaml"))
+    if not os.path.exists(path):
+        write_note("using default config")
+        return TrainConfig()
+    write_note(f"using config file at {path}")
+    with open(path, "r") as f:
+        return tyro.from_yaml(TrainConfig, f)
+
+
+def main(config: TrainConfig):
+    write_note(f"Number of JAX devices: {jax.device_count()}")
+    write_note(f"Number of JAX processes: {jax.process_count()}")
+
+    # set seeds
+    np.random.seed(config.seed)
+    # keeping tensorflow wild for now
+
+    # wandb
+    if config.wandb is not None and jax.process_index() == 0:
+        wandb.init(**asdict(config.wandb))
+        wandb.config.update(asdict(config))
+
+    block_size = config.model.n_positions
+    using_gpu = jax.devices()[0].platform == "gpu"
+
+    # ===== mesh =====
+    write_note("creating 1D FSDP mesh")
+    device_mesh = mesh_utils.create_device_mesh((jax.device_count(),))
+    devices_flat = device_mesh.flatten()
+    mesh = Mesh(devices=device_mesh, axis_names="fsdp")
+
+    # ===== datasets =====
+    write_note("creating datasets")
+    train_ds = get_dataset(
+        config.train_pattern,
+        devices_flat,
+        config.batch_size,
+        block_size,
+        interleave_cycle_length=max(1, 32 // jax.process_count()),
+        shuffle_buffer_size=config.shuffle_buffer_size,
+        tf_prefetch=10,
+        device_prefetch=2 if using_gpu else 1,
+    )
+    val_ds = get_dataset(
+        config.val_pattern,
+        devices_flat,
+        config.batch_size,
+        block_size,
+        interleave_cycle_length=max(1, 8 // jax.process_count()),
+    )
+    hellaswag_ds = prepare_hellaswag(config, devices_flat)
+
+    # ===== optimizer =====
+    write_note("creating optimizer")
+    lr_schedule = optax.join_schedules(
+        schedules=[
+            optax.linear_schedule(
+                0.0, config.optimizer.learning_rate, config.optimizer.warmup_steps
+            ),
+            optax.linear_schedule(
+                config.optimizer.learning_rate,
+                0.0,
+                config.train_steps - config.optimizer.warmup_steps,
+            ),
+        ],
+        boundaries=[config.optimizer.warmup_steps],
+    )
 
     optimizer = []
     optimizer.append(optax.clip_by_global_norm(config.optimizer.grad_clip))
-    print("using optimizer", config.optimizer.type)
+    write_note(f"using {config.optimizer.type} optimizer")
     if config.optimizer.type in ["adam", "adamw"]:
         optimizer.append(
             optax.adamw(
-                learning_rate,
+                lr_schedule,
                 *config.optimizer.betas,
                 weight_decay=config.optimizer.weight_decay,
                 mask=param_decay_mask,
@@ -230,7 +287,7 @@ def init_train_state(key, config: TrainConfig, learning_rate) -> TrainState:
     elif config.optimizer.type in ["psgd_affine", "affine"]:
         optimizer.append(
             affine(
-                learning_rate=learning_rate,
+                learning_rate=lr_schedule,
                 preconditioner_update_probability=config.optimizer.preconditioner_update_probability,
                 b1=config.optimizer.betas[0],
                 nesterov=False,
@@ -252,128 +309,97 @@ def init_train_state(key, config: TrainConfig, learning_rate) -> TrainState:
         raise ValueError("Unknown optimizer type")
 
     optimizer.append(optax.apply_every(config.optimizer.gradient_accumulation_steps))
-
     optimizer = optax.chain(*optimizer)
 
-    train_state = TrainState.create(
-        apply_fn=model.__call__, params=params, tx=optimizer
+    # ===== training state =====
+    def init_train_state(key) -> TrainState:
+        # we have to keep these transformers calls within jit to avoid sharding errors
+        model_config = transformers.GPT2Config(**asdict(config.model))
+        model = transformers.FlaxAutoModelForCausalLM.from_config(
+            model_config, _do_init=False
+        )
+        params = model.init_weights(rng=key, input_shape=(1, config.model.n_positions))
+        train_state = TrainState.create(
+            apply_fn=model.__call__, params=params, tx=optimizer
+        )
+        return train_state
+
+    # ===== shard and transfer =====
+    write_note("creating and sharding train state")
+    repl_sharding = jax.sharding.NamedSharding(mesh, P())
+
+    rng = jax.random.PRNGKey(jax.device_put(config.seed, jax.devices("cpu")[0]))
+
+    train_state_shape = jax.eval_shape(init_train_state, rng)
+
+    op = fsdp_sharding("fsdp", min_size_to_shard_mb=config.min_size_to_shard_mb)
+    train_state_sharding = infer_sharding(params=train_state_shape, mesh=mesh, op=op)
+
+    rng, rng_init = jax.random.split(rng, 2)
+    rng_init = reshard(rng_init, repl_sharding)
+
+    train_state = jax.jit(init_train_state, out_shardings=train_state_sharding)(
+        rng_init
     )
 
-    return train_state
-
-
-def get_default_config() -> TrainConfig:
-    # use this file to set default values
-    path = os.environ.get("GPT_CONFIG", os.path.join("config", "gpt2.yaml"))
-    if not os.path.exists(path):
-        return TrainConfig()
-    logging.info(f"using config file at {path}")
-    with open(path, "r") as f:
-        return tyro.from_yaml(TrainConfig, f)
-
-
-if __name__ == "__main__":
-    config = tyro.cli(TrainConfig, default=get_default_config(), use_underscores=True)
-
-    print(f"Number of JAX devices: {jax.device_count()}")
-    print(f"Number of JAX processes: {jax.process_count()}")
-
-    # set seeds
-    np.random.seed(config.seed)
-    tf.random.set_seed(config.seed)
-
-    if config.wandb is not None and jax.process_index() == 0:
-        wandb.init(**asdict(config.wandb))
-        wandb.config.update(asdict(config))
-
-    block_size = config.model.n_positions
-
-    # ===== datasets =====
-    train_ds = get_dataset(
-        config.train_pattern,
-        config.batch_size,
-        block_size,
-        config.shuffle_buffer_size,
-        interleave_cycle_length=max(1, 32 // jax.process_count()),
-    )
-    using_gpu = jax.devices()[0].platform == "gpu"
-    train_ds = flax.jax_utils.prefetch_to_device(train_ds, 2 if using_gpu else 1)
-    val_ds = get_dataset(config.val_pattern, config.batch_size, block_size)
-    hellaswag_ds = prepare_hellaswag(config)
-
-    # =====  init parameters ============
-    key = jax.random.PRNGKey(config.seed)
-    key, key_params, key_dropout = jax.random.split(key, 3)
-    # make sure dropout keys are different for each device (local and global)
-    key_dropout = jax.random.fold_in(key_dropout, jax.process_index())
-    keys_dropout = jax.random.split(key_dropout, jax.local_device_count())
-
-    # ===== learning rate schedule =====
-    optimizer = optax.join_schedules(
-        schedules=[
-            optax.linear_schedule(
-                0.0, config.optimizer.learning_rate, config.optimizer.warmup_steps
-            ),
-            optax.linear_schedule(
-                config.optimizer.learning_rate,
-                0.0,
-                config.train_steps - config.optimizer.warmup_steps,
-            ),
-        ],
-        boundaries=[config.optimizer.warmup_steps],
-    )
-
-    train_state = init_train_state(key_params, config, optimizer)
+    rng = reshard(rng, repl_sharding)
 
     num_params = count_params(train_state.params)
     if jax.process_index() == 0:
-        # logging.info(f'PARAMETER COUNT: {num_params:,}')
-        print(f"PARAMETER COUNT: {num_params:,}")
+        write_note("TRAIN STATE SHAPES:")
+        pprint(
+            jax.tree.map(lambda x: x.shape, train_state),
+            indent=2,
+            width=120,
+            compact=True,
+        )
+        write_note("TRAIN STATE SHARDING:")
+        pprint(train_state_sharding, indent=2, width=120, compact=True)
+        write_note(f"PARAMETER COUNT: {num_params:,}")
 
     best_val_loss = float("inf")
 
-    # ==== restore dataset and train state ==== #
+    # ==== restore train state ====
     # restore unreplicated optimizer + model state from last checkpoint.
     # this is a no-op if no checkpoints exist
-    if config.keep_checkpoints > 0:
+    if config.keep_checkpoints > 0:  # TODO implement checkpointing to wandb
         train_state = checkpoints.restore_checkpoint(
             f"{config.out_dir}/checkpoints/train_state", train_state
         )
 
+    # ====== jit functions ========
+    train_step_jit = jax.jit(
+        train_step,
+        static_argnames=("use_bfloat16",),
+        donate_argnames=("state",),
+        out_shardings=(repl_sharding, train_state_sharding),
+    )
+    eval_step_jit = jax.jit(eval_step, out_shardings=repl_sharding)
+    eval_hellaswag_jit = jax.jit(eval_hellaswag, out_shardings=repl_sharding)
+    get_lr = jax.jit(lr_schedule, out_shardings=repl_sharding)
+
     # grab step from last checkpoint
-    step = int(train_state.step)
-
-    train_iter = iter(train_ds)
-    # We need to be able to save the dataset state for stopping and resuming training
-    # we'll save a dataset checkpoint for each shard
-    if config.keep_checkpoints > 0:
-        dataset_manager = tf.train.CheckpointManager(
-            tf.train.Checkpoint(iterator=train_iter),
-            f"{config.out_dir}/checkpoints/dataset_{jax.process_index()}",
-            max_to_keep=config.keep_checkpoints,
-        )
-        dataset_manager.restore_or_initialize()
-    else:
-        dataset_manager = None
-
-    # replicate parameters to each device
-    train_state = replicate(train_state)
+    step = 0
 
     train_losses = []
-    print("starting training")
+    write_note("starting training")
     for step in range(step, config.train_steps):
-        tokens = next(train_iter)
-        loss, train_state = train_step(
-            train_state, tokens, keys_dropout, config.bfloat16_compute
+        tokens = next(train_ds)
+        loss, train_state = train_step_jit(
+            train_state, tokens, rng, config.bfloat16_compute
         )
-        train_losses.append(loss[0].item())
+        train_losses.append(jax.device_get(loss).item())
 
         if (config.wandb is not None) and (jax.process_index() == 0) and step % 10 == 0:
             train_loss = np.mean(train_losses)
             wandb.log(
                 {
                     "train_loss": train_loss,
-                    "lr": (optimizer(step) if callable(optimizer) else optimizer),
+                    "lr": (
+                        jax.device_get(get_lr(jax.device_put(step, repl_sharding)))
+                        if callable(lr_schedule)
+                        else lr_schedule
+                    ),
                     "tokens": step
                     * config.batch_size
                     * jax.device_count()
@@ -388,16 +414,17 @@ if __name__ == "__main__":
             val_losses = []
             for _ in range(config.eval_steps):
                 tokens = next(val_ds)
-                loss = eval_step(train_state, tokens)
-                val_losses.append(loss[0].item())
+                loss = eval_step_jit(train_state, tokens)
+                val_losses.append(jax.device_get(loss).item())
 
             val_loss = np.mean(val_losses)
 
             # hellaswag
             hs_batch = next(hellaswag_ds)
-            hellaswag_acc = eval_hellaswag(train_state, *hs_batch)[0].item()
+            hellaswag_acc = eval_hellaswag_jit(train_state, *hs_batch)
+            hellaswag_acc = jax.device_get(hellaswag_acc).item()
 
-            print(
+            write_note(
                 f"step: {step}, val_loss: {val_loss:.4f}, "
                 f"hellaswag_acc: {hellaswag_acc:.4f}"
             )
@@ -411,14 +438,18 @@ if __name__ == "__main__":
                     # save train state in process 0
                     checkpoints.save_checkpoint(
                         f"{config.out_dir}/checkpoints/train_state",
-                        unreplicate(train_state),
+                        jax.device_get(train_state),
                         step,
                         keep=config.keep_checkpoints,
                         overwrite=True,
                     )
-                dataset_manager.save(step)
 
             if (config.wandb is not None) and (jax.process_index() == 0):
                 wandb.log(
                     {"val_loss": val_loss, "hellaswag_acc": hellaswag_acc}, step=step
                 )
+
+
+if __name__ == "__main__":
+    config = tyro.cli(TrainConfig, default=get_default_config(), use_underscores=True)
+    main(config)

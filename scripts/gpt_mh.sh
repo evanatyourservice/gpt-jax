@@ -9,7 +9,6 @@ EXPERIMENT=run_$(date +%Y-%m-%d_%H-%M-%S)
 echo $EXPERIMENT
 
 export WANDB_API_KEY=$WANDB_API_KEY
-export TF_CPP_MIN_LOG_LEVEL=3
 export GPT_CONFIG=config/gpt2.yaml
 
 cd gpt-jax
