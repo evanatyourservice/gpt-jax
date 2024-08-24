@@ -77,7 +77,8 @@ def get_dataset(
 
 
 def prepare_hellaswag(
-    config,
+    batch_size: int,
+    block_size: int,
     flat_devices,
     shuffle_buffer_size: Optional[int] = 1000,
     tf_prefetch: int = 2,
@@ -86,7 +87,6 @@ def prepare_hellaswag(
     """Read file and tokenize the hellaswag dataset."""
     print("preparing hellaswag")
 
-    block_size = config.model.n_positions
     enc = tiktoken.get_encoding("gpt2")
 
     all_data = []
@@ -123,7 +123,7 @@ def prepare_hellaswag(
     ds = ds.repeat()
     if shuffle_buffer_size is not None:
         ds = ds.shuffle(shuffle_buffer_size)
-    ds = ds.batch(config.batch_size // jax.process_count(), drop_remainder=True)
+    ds = ds.batch(batch_size // jax.process_count(), drop_remainder=True)
     ds = ds.with_options(OPTIONS)
     ds = ds.prefetch(tf_prefetch)
     ds = ds.as_numpy_iterator()

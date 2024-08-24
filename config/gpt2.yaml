@@ -2,12 +2,13 @@
 !dataclass:TrainConfig
 shuffle_buffer_size: 256
 eval_interval: 250
-eval_steps: 16
-hs_eval_steps: 16
+eval_steps: 12
+hs_eval_steps: 12
 eval_only: False
 keep_checkpoints: 0
-batch_size: 256
+batch_size: 128
 train_steps: 100000
+bfloat16_compute: True
 optimizer: !dataclass:OptimizerConfig
     type: "adamw"
     learning_rate: 0.001

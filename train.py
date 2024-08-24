@@ -253,7 +253,11 @@ def main(config: TrainConfig):
         block_size,
         interleave_cycle_length=max(1, 8 // jax.process_count()),
     )
-    hellaswag_ds = prepare_hellaswag(config, devices_flat)
+    hellaswag_ds = prepare_hellaswag(
+        max(config.batch_size // 4, 1),  # hellaswag has 4 seqs per problem
+        block_size,
+        devices_flat,
+    )
 
     # ===== optimizer =====
     write_note("creating optimizer")
@@ -416,13 +420,15 @@ def main(config: TrainConfig):
                 tokens = next(val_ds)
                 loss = eval_step_jit(train_state, tokens)
                 val_losses.append(jax.device_get(loss).item())
-
             val_loss = np.mean(val_losses)
 
             # hellaswag
-            hs_batch = next(hellaswag_ds)
-            hellaswag_acc = eval_hellaswag_jit(train_state, *hs_batch)
-            hellaswag_acc = jax.device_get(hellaswag_acc).item()
+            hs_accs = []
+            for _ in range(config.hs_eval_steps):
+                hs_batch = next(hellaswag_ds)
+                hs_acc = eval_hellaswag_jit(train_state, *hs_batch)
+                hs_accs.append(jax.device_get(hs_acc).item())
+            hellaswag_acc = np.mean(hs_accs)
 
             write_note(
                 f"step: {step}, val_loss: {val_loss:.4f}, "
