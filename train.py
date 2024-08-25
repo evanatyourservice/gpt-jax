@@ -126,14 +126,14 @@ class TrainConfig:
 
 
 def train_step(
-    state: TrainState, tokens: jnp.ndarray, dropout_key, use_bfloat16: bool
+    state: TrainState, tokens: jnp.ndarray, dropout_key, bfloat16_compute: bool
 ) -> Tuple[jnp.ndarray, TrainState]:
 
     dropout_key = jax.random.fold_in(dropout_key, state.step)
 
     def loss_fn(params) -> jnp.ndarray:
         X, Y = tokens[:, :-1], tokens[:, 1:]
-        if use_bfloat16:
+        if bfloat16_compute:
             X = X.astype(jnp.bfloat16)
             params = optax.tree_utils.tree_cast(params, jnp.bfloat16)
         logits = state.apply_fn(X, params=params, dropout_rng=dropout_key, train=True)[
