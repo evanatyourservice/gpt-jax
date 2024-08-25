@@ -7,7 +7,7 @@ hs_eval_steps: 16
 keep_checkpoints: 0
 batch_size: 128
 train_steps: 50000
-bfloat16_compute: False
+bfloat16_compute: True
 optimizer: !dataclass:OptimizerConfig
     type: "adamw"
     learning_rate: 0.001
