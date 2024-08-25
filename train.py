@@ -9,7 +9,7 @@ import tyro
 import jax
 import jax.numpy as jnp
 from jax.experimental import mesh_utils
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import transformers
 import flax
 from flax.training import checkpoints
@@ -227,7 +227,7 @@ def main(config: TrainConfig):
     block_size = config.model.n_positions
     using_gpu = jax.devices()[0].platform == "gpu"
 
-    # ===== mesh =====
+    # ===== create device mesh =====
     write_note("creating 1D FSDP mesh")
     device_mesh = mesh_utils.create_device_mesh((jax.device_count(),))
     devices_flat = device_mesh.flatten()
@@ -276,45 +276,50 @@ def main(config: TrainConfig):
         boundaries=[config.optimizer.warmup_steps],
     )
 
-    optimizer = []
-    optimizer.append(optax.clip_by_global_norm(config.optimizer.grad_clip))
-    write_note(f"using {config.optimizer.type} optimizer")
-    if config.optimizer.type in ["adam", "adamw"]:
-        optimizer.append(
-            optax.adamw(
-                lr_schedule,
-                *config.optimizer.betas,
-                weight_decay=config.optimizer.weight_decay,
-                mask=param_decay_mask,
-                mu_dtype=jnp.bfloat16,
+    def make_opt():
+        optimizer = []
+        optimizer.append(optax.clip_by_global_norm(config.optimizer.grad_clip))
+        write_note(f"using {config.optimizer.type} optimizer")
+        if config.optimizer.type in ["adam", "adamw"]:
+            optimizer.append(
+                optax.adamw(
+                    lr_schedule,
+                    *config.optimizer.betas,
+                    weight_decay=config.optimizer.weight_decay,
+                    mask=param_decay_mask,
+                    mu_dtype=jnp.bfloat16,
+                )
             )
-        )
-    elif config.optimizer.type in ["psgd_affine", "affine"]:
-        optimizer.append(
-            affine(
-                learning_rate=lr_schedule,
-                preconditioner_update_probability=config.optimizer.preconditioner_update_probability,
-                b1=config.optimizer.betas[0],
-                nesterov=False,
-                update_global_norm_clip=config.optimizer.update_global_norm_clip,
-                update_elementwise_clip=config.optimizer.update_elementwise_clip,
-                weight_decay=config.optimizer.weight_decay,
-                mask=param_decay_mask,
-                max_size_triangular=config.optimizer.max_size_triangular,
-                max_skew_triangular=config.optimizer.max_skew_triangular,
-                step_normalizer_order="2nd",
-                precond_lr=config.optimizer.precond_lr,
-                precond_init_scale=config.optimizer.precond_init_scale,
-                seed=None,
-                mu_dtype=jnp.bfloat16,
-                precision="tensorfloat32",
+        elif config.optimizer.type in ["psgd_affine", "affine"]:
+            optimizer.append(
+                affine(
+                    learning_rate=lr_schedule,
+                    preconditioner_update_probability=config.optimizer.preconditioner_update_probability,
+                    b1=config.optimizer.betas[0],
+                    nesterov=False,
+                    update_global_norm_clip=config.optimizer.update_global_norm_clip,
+                    update_elementwise_clip=config.optimizer.update_elementwise_clip,
+                    weight_decay=config.optimizer.weight_decay,
+                    mask=param_decay_mask,
+                    max_size_triangular=config.optimizer.max_size_triangular,
+                    max_skew_triangular=config.optimizer.max_skew_triangular,
+                    step_normalizer_order="2nd",
+                    precond_lr=config.optimizer.precond_lr,
+                    precond_init_scale=config.optimizer.precond_init_scale,
+                    seed=None,
+                    mu_dtype=jnp.bfloat16,
+                    precision="tensorfloat32",
+                )
             )
-        )
-    else:
-        raise ValueError("Unknown optimizer type")
+        else:
+            raise ValueError("Unknown optimizer type")
 
-    optimizer.append(optax.apply_every(config.optimizer.gradient_accumulation_steps))
-    optimizer = optax.chain(*optimizer)
+        optimizer.append(
+            optax.apply_every(config.optimizer.gradient_accumulation_steps)
+        )
+        return optax.chain(*optimizer)
+
+    optimizer = make_opt()
 
     # ===== training state =====
     def init_train_state(key) -> TrainState:
@@ -331,7 +336,8 @@ def main(config: TrainConfig):
 
     # ===== shard and transfer =====
     write_note("creating and sharding train state")
-    repl_sharding = jax.sharding.NamedSharding(mesh, P())
+    repl_sharding = NamedSharding(mesh, P())
+    data_sharding = NamedSharding(mesh, P("fsdp"))
 
     rng = jax.random.PRNGKey(jax.device_put(config.seed, jax.devices("cpu")[0]))
 
@@ -373,16 +379,34 @@ def main(config: TrainConfig):
         )
 
     # ====== jit functions ========
+    # we specify in_shardings for sake of clarity, but they are inferred
     train_step_jit = jax.jit(
         train_step,
         static_argnames=("bfloat16_compute",),
         donate_argnames=("state",),
+        in_shardings=(train_state_sharding, data_sharding, rng.sharding),
         out_shardings=(repl_sharding, train_state_sharding),
     )
-    eval_step_jit = jax.jit(eval_step, out_shardings=repl_sharding)
-    eval_hellaswag_jit = jax.jit(eval_hellaswag, out_shardings=repl_sharding)
-    get_lr = jax.jit(lr_schedule, out_shardings=repl_sharding)
+    eval_step_jit = jax.jit(
+        eval_step,
+        in_shardings=(train_state_sharding, data_sharding),
+        out_shardings=repl_sharding,
+    )
+    eval_hellaswag_jit = jax.jit(
+        eval_hellaswag,
+        in_shardings=(
+            train_state_sharding,
+            data_sharding,
+            data_sharding,
+            data_sharding,
+        ),
+        out_shardings=repl_sharding,
+    )
+    get_lr = jax.jit(
+        lr_schedule, in_shardings=repl_sharding, out_shardings=repl_sharding
+    )
 
+    # ======= train ========
     # grab step from last checkpoint
     step = 0
 
