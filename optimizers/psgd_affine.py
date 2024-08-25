@@ -683,7 +683,7 @@ def _update_precond_affine_dropv_math(
             #   3) both sides use dense preconditioner, but gradient is skewed (no saving for square shape gradient)
             key, subkey = jax.random.split(key)
             v = otu.tree_random_like(
-                subkey, dG, partial(jax.random.rademacher, dtype=dG.dtype)
+                subkey, dG, partial(jax.random.normal, dtype=dG.dtype)
             )
             if precond_sharding is not None:
                 v = jax.lax.with_sharding_constraint(v, precond_sharding)
