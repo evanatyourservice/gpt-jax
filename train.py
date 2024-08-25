@@ -1,3 +1,4 @@
+from functools import partial
 from pprint import pprint
 from typing import Tuple, Optional
 from dataclasses import dataclass, field, asdict
@@ -18,7 +19,7 @@ import optax
 import tensorflow as tf
 
 from dataset import get_dataset, prepare_hellaswag
-from optimizers.psgd_affine import affine
+from optimizers.psgd_affine import affine, _shape_as_matrix
 from sharding import infer_sharding, fsdp_sharding
 from utils import reshard, write_note
 
@@ -278,7 +279,7 @@ def main(config: TrainConfig):
         boundaries=[config.optimizer.warmup_steps],
     )
 
-    def make_opt():
+    def make_opt(precond_sharding=None):
         optimizer = []
         optimizer.append(optax.clip_by_global_norm(config.optimizer.grad_clip))
         write_note(f"using {config.optimizer.type} optimizer")
@@ -293,7 +294,7 @@ def main(config: TrainConfig):
                 )
             )
         elif config.optimizer.type in ["psgd_affine", "affine"]:
-            update_prob_schedule = lambda n: jnp.maximum(jnp.exp(-0.001 * n), 0.05)
+            update_prob_schedule = lambda n: jnp.maximum(jnp.exp(-0.0005 * n), 0.01)
             optimizer.append(
                 affine(
                     lr_schedule,
@@ -306,8 +307,10 @@ def main(config: TrainConfig):
                     precond_lr=config.optimizer.precond_lr,
                     precond_init_scale=config.optimizer.precond_init_scale,
                     update_global_norm_clip=config.optimizer.update_global_norm_clip,
+                    momentum_before_precond_update=True,
                     mu_dtype=jnp.bfloat16,
                     precision="tensorfloat32",
+                    precond_sharding=precond_sharding,
                 )
             )
         else:
@@ -318,21 +321,6 @@ def main(config: TrainConfig):
         )
         return optax.chain(*optimizer)
 
-    optimizer = make_opt()
-
-    # ===== training state =====
-    def init_train_state(key) -> TrainState:
-        # we have to keep these transformers calls within jit to avoid sharding errors
-        model_config = transformers.GPT2Config(**asdict(config.model))
-        model = transformers.FlaxAutoModelForCausalLM.from_config(
-            model_config, _do_init=False
-        )
-        params = model.init_weights(rng=key, input_shape=(1, config.model.n_positions))
-        train_state = TrainState.create(
-            apply_fn=model.__call__, params=params, tx=optimizer
-        )
-        return train_state
-
     # ===== shard and transfer =====
     write_note("creating and sharding train state")
     repl_sharding = NamedSharding(mesh, P())
@@ -340,16 +328,58 @@ def main(config: TrainConfig):
 
     rng = jax.random.PRNGKey(jax.device_put(config.seed, jax.devices("cpu")[0]))
 
-    train_state_shape = jax.eval_shape(init_train_state, rng)
+    def init_train_state(key):
+        model_config = transformers.GPT2Config(**asdict(config.model))
+        model = transformers.FlaxAutoModelForCausalLM.from_config(
+            model_config, _do_init=False
+        )
+        params = model.init_weights(rng=key, input_shape=(1, config.model.n_positions))
+        # delay optimizer creation to pass in preconditioner sharding
+        train_state = TrainState(
+            step=0, apply_fn=model.__call__, params=params, tx=None, opt_state=None
+        )
+        return train_state
+
+    train_state_shapes = jax.eval_shape(init_train_state, rng)
 
     op = fsdp_sharding("fsdp", min_size_to_shard_mb=config.min_size_to_shard_mb)
-    train_state_sharding = infer_sharding(params=train_state_shape, mesh=mesh, op=op)
+    train_state_sharding = infer_sharding(params=train_state_shapes, mesh=mesh, op=op)
 
     rng, rng_init = jax.random.split(rng, 2)
     rng_init = reshard(rng_init, repl_sharding)
 
     train_state = jax.jit(init_train_state, out_shardings=train_state_sharding)(
         rng_init
+    )
+
+    # make optimizer and its shardings
+    optimizer = make_opt()
+
+    opt_state_shapes = jax.eval_shape(optimizer.init, train_state.params)
+    opt_state_sharding = infer_sharding(params=opt_state_shapes, mesh=mesh, op=op)
+    opt_state = jax.jit(optimizer.init, out_shardings=opt_state_sharding)(
+        train_state.params
+    )
+
+    def get_precond_sharding(params):
+        """Follows PSGD affine matrix reshaping and applies sharding strategy."""
+        # returns tuples if (reshape_fn, unreshape_fn, shape)
+        affine_reshapers = [_shape_as_matrix(x) for x in jax.tree.leaves(params)]
+        # grab preconditioner shapes and make jax.ShapeDtypeStructs
+        precond_shapes = [
+            jax.ShapeDtypeStruct(r[2], jnp.float32) for r in affine_reshapers
+        ]
+        # apply sharding strategy
+        return infer_sharding(params=precond_shapes, mesh=mesh, op=op)
+
+    # remake optimizer with preconditioner sharding passed in
+    precond_sharding = get_precond_sharding(train_state.params)
+    optimizer = make_opt(precond_sharding=precond_sharding)
+
+    # finish making train state (pass in optimizer and opt_state)
+    train_state = train_state.replace(tx=optimizer, opt_state=opt_state)
+    train_state_sharding = train_state_sharding.replace(
+        tx=optimizer, opt_state=opt_state_sharding
     )
 
     rng = reshard(rng, repl_sharding)
@@ -366,8 +396,6 @@ def main(config: TrainConfig):
         write_note("TRAIN STATE SHARDING:")
         pprint(train_state_sharding, indent=2, width=120, compact=True)
         write_note(f"PARAMETER COUNT: {num_params:,}")
-
-    best_val_loss = float("inf")
 
     # ==== restore train state ====
     # restore unreplicated optimizer + model state from last checkpoint.
@@ -408,6 +436,8 @@ def main(config: TrainConfig):
     # ======= train ========
     # grab step from last checkpoint
     step = 0
+
+    best_val_loss = float("inf")
 
     train_losses = []
     write_note("starting training")
