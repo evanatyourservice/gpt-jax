@@ -249,6 +249,9 @@ def scale_by_affine(
                 updates, base.EmptyState
             )
 
+        # elementwise clipping
+        updates = jax.tree.map(lambda x: jnp.clip(x, -1.0, 1.0), updates)
+
         mu = otu.tree_cast(mu, mu_dtype)
         state = PSGDAffineState(count=count_inc, key=key, mu=mu, Qs=Qs)
         return updates, state
