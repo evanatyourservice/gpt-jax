@@ -311,7 +311,7 @@ def main(config: TrainConfig):
                     precond_lr=precond_lr_schedule,
                     precond_init_scale=config.optimizer.precond_init_scale,
                     update_global_norm_clip=config.optimizer.update_global_norm_clip,
-                    momentum_before_precond_update=True,
+                    momentum_before_precond_update=True,  # experimental
                     mu_dtype=jnp.float32,
                     precision="tensorfloat32",
                     precond_sharding=precond_sharding,
