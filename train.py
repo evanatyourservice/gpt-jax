@@ -281,7 +281,8 @@ def main(config: TrainConfig):
 
     def make_opt(precond_sharding=None):
         optimizer = []
-        optimizer.append(optax.clip_by_global_norm(config.optimizer.grad_clip))
+        if config.optimizer.grad_clip > 0:
+            optimizer.append(optax.clip_by_global_norm(config.optimizer.grad_clip))
         write_note(f"using {config.optimizer.type} optimizer")
         if config.optimizer.type in ["adam", "adamw"]:
             optimizer.append(
@@ -290,7 +291,7 @@ def main(config: TrainConfig):
                     *config.optimizer.betas,
                     weight_decay=config.optimizer.weight_decay,
                     mask=param_decay_mask,
-                    mu_dtype=jnp.bfloat16,
+                    mu_dtype=jnp.float32,
                 )
             )
         elif config.optimizer.type in ["psgd_affine", "affine"]:
@@ -306,9 +307,9 @@ def main(config: TrainConfig):
                     precond_lr=config.optimizer.precond_lr,
                     precond_init_scale=config.optimizer.precond_init_scale,
                     update_global_norm_clip=config.optimizer.update_global_norm_clip,
-                    momentum_before_precond_update=True,
-                    mu_dtype=jnp.bfloat16,
-                    precision="float32",
+                    momentum_before_precond_update=False,
+                    mu_dtype=jnp.float32,
+                    precision="tensorfloat32",
                     precond_sharding=precond_sharding,
                 )
             )
