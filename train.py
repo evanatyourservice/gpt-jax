@@ -375,7 +375,7 @@ def main(config: TrainConfig):
     # ====== jit functions ========
     train_step_jit = jax.jit(
         train_step,
-        static_argnames=("use_bfloat16",),
+        static_argnames=("bfloat16_compute",),
         donate_argnames=("state",),
         out_shardings=(repl_sharding, train_state_sharding),
     )
