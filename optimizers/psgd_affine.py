@@ -10,7 +10,7 @@ from optax._src.numerics import safe_int32_increment
 from optax._src.utils import canonicalize_dtype
 from optax._src.combine import chain
 
-from psgd_jax.utils import add_eps, apply_momentum
+from optimizers.utils import add_eps, apply_momentum
 
 
 class PSGDAffineState(NamedTuple):
@@ -24,13 +24,13 @@ def scale_by_affine(
     preconditioner_update_probability: Union[float, Callable[[int], float]] = 1.0,
     b1: float = 0.9,
     nesterov: bool = False,
-    update_global_norm_clip: Optional[float] = None,
-    update_elementwise_clip: bool = False,
-    max_size_triangular: int = 0,
-    max_skew_triangular: int = 0,
-    step_normalizer_order: str = "2nd",
+    max_size_triangular: int = 4096,
+    max_skew_triangular: int = 128,
     precond_lr: Union[float, Callable[[int], float]] = 0.1,
     precond_init_scale: Optional[float] = None,
+    update_global_norm_clip: Optional[float] = None,
+    momentum_before_precond_update: bool = False,
+    step_normalizer_order: str = "2nd",
     seed: Optional[PRNGKey] = None,
     mu_dtype: Optional[Union[str, jnp.dtype]] = None,
     precision: str = "tensorfloat32",
@@ -43,15 +43,16 @@ def scale_by_affine(
             preconditioner.
         b1: float, momentum parameter.
         nesterov: bool, whether to use Nesterov momentum.
-        update_global_norm_clip: optional float, clip updates by global norm.
-        update_elementwise_clip: bool, whether to clip updates to within [-1, 1].
         max_size_triangular: int, max size for affine preconditioner to be
             triangular.
         max_skew_triangular: int, max skew for affine preconditioner to be
             triangular.
-        step_normalizer_order: str, '1st' or '2nd'.
         precond_lr: float or callable, learning rate for the preconditioner.
         precond_init_scale: optional float, initial scale for the preconditioner.
+        update_global_norm_clip: optional float, clip updates by global norm.
+        momentum_before_precond_update: bool, whether to pass momentum into
+            preconditioner instead of raw gradients.
+        step_normalizer_order: str, '1st' or '2nd'.
         seed: Optional PRNGKey, random seed.
         mu_dtype: optional str or jnp.dtype, dtype of the momentum accumulator.
             Defaults to the same dtype as the parameters.
@@ -64,11 +65,6 @@ def scale_by_affine(
 
     def init_fn(params):
         key = seed if seed is not None else jax.random.PRNGKey(36)
-
-        if update_global_norm_clip is not None:
-            print("PSGD: Using global norm clipping.")
-        if update_elementwise_clip:
-            print("PSGD: Using elementwise clipping.")
 
         # momentum
         mu = None
@@ -109,6 +105,10 @@ def scale_by_affine(
         count_inc = safe_int32_increment(state.count)
         key = state.key
         affine_reshapers = [_shape_as_matrix(x) for x in jax.tree.leaves(updates)]
+
+        update_prob_in = preconditioner_update_probability
+        if isinstance(preconditioner_update_probability, Callable):
+            update_prob_in = preconditioner_update_probability(count_inc)
 
         precond_lr_in = precond_lr
         if isinstance(precond_lr, Callable):
@@ -196,17 +196,10 @@ def scale_by_affine(
             # update cond not passed in, create here
             key, subkey = jax.random.split(key)
             update_preconditioner = jnp.logical_or(
-                jax.random.uniform(subkey) < preconditioner_update_probability,
-                state.count < 2,
+                jax.random.uniform(subkey) < update_prob_in, state.count < 2
             )
-
-        # momentum
-        mu = None
-        if state.mu is not None:
-            updates, mu = apply_momentum(updates, state.mu, count_inc, b1, nesterov)
-
-        # preconditioning momentum update
-        hvp_in = updates
+            # use grads as Hvp
+            Hvp = updates
 
         key, Qs = jax.lax.cond(
             update_preconditioner,
@@ -214,9 +207,14 @@ def scale_by_affine(
             _dont_update_precond,
             key,
             state,
-            hvp_in,
+            Hvp,
             vector,
         )
+
+        # momentum
+        mu = None
+        if state.mu is not None:
+            updates, mu = apply_momentum(updates, state.mu, count_inc, b1, nesterov)
 
         # preconditioning
         flat_updates = [
@@ -234,8 +232,6 @@ def scale_by_affine(
             updates, _ = clipping.clip_by_global_norm(update_global_norm_clip).update(
                 updates, base.EmptyState
             )
-        if update_elementwise_clip:
-            updates = jax.tree.map(lambda x: jnp.clip(x, -1.0, 1.0), updates)
 
         mu = otu.tree_cast(mu, mu_dtype)
         state = PSGDAffineState(count=count_inc, key=key, mu=mu, Qs=Qs)
@@ -245,19 +241,18 @@ def scale_by_affine(
 
 
 def affine(
-    learning_rate: Union[float, Callable[[int], float]] = 0.001,
-    preconditioner_update_probability: float = 1.0,
+    learning_rate: Union[float, Callable[[int], float]] = 0.01,
+    preconditioner_update_probability: Union[float, Callable[[int], float]] = 1.0,
     b1: float = 0.9,
     nesterov: bool = False,
-    update_global_norm_clip: Optional[float] = None,
-    update_elementwise_clip: bool = False,
     weight_decay: float = 0.0,
     mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None,
-    max_size_triangular: int = 0,
-    max_skew_triangular: int = 0,
-    step_normalizer_order: str = "2nd",
+    max_size_triangular: int = 4096,
+    max_skew_triangular: int = 128,
     precond_lr: Union[float, Callable[[int], float]] = 0.1,
     precond_init_scale: Optional[float] = None,
+    update_global_norm_clip: Optional[float] = None,
+    step_normalizer_order: str = "2nd",
     seed: Optional[PRNGKey] = None,
     mu_dtype: Optional[Union[str, jnp.dtype]] = None,
     precision: str = "tensorfloat32",
@@ -271,17 +266,16 @@ def affine(
             preconditioner.
         b1: float, momentum parameter.
         nesterov: bool, whether to use Nesterov momentum.
-        update_global_norm_clip: optional float, clip updates by global norm.
-        update_elementwise_clip: bool, whether to clip updates to within [-1, 1].
         weight_decay: float, weight decay.
         mask: optional Any or callable, mask to apply to parameters.
         max_size_triangular: int, max size for affine preconditioner to be
             triangular.
         max_skew_triangular: int, max skew for affine preconditioner to be
             triangular.
-        step_normalizer_order: str, '1st' or '2nd'.
         precond_lr: float or callable, learning rate for the preconditioner.
         precond_init_scale: optional float, initial scale for the preconditioner.
+        update_global_norm_clip: optional float, clip updates by global norm.
+        step_normalizer_order: str, '1st' or '2nd'.
         seed: Optional PRNGKey, random seed.
         mu_dtype: optional str or jnp.dtype, dtype of the momentum accumulator.
             Defaults to the same dtype as the parameters.
@@ -295,13 +289,12 @@ def affine(
             preconditioner_update_probability=preconditioner_update_probability,
             b1=b1,
             nesterov=nesterov,
-            update_global_norm_clip=update_global_norm_clip,
-            update_elementwise_clip=update_elementwise_clip,
             max_size_triangular=max_size_triangular,
             max_skew_triangular=max_skew_triangular,
-            step_normalizer_order=step_normalizer_order,
             precond_lr=precond_lr,
             precond_init_scale=precond_init_scale,
+            update_global_norm_clip=update_global_norm_clip,
+            step_normalizer_order=step_normalizer_order,
             seed=seed,
             mu_dtype=mu_dtype,
             precision=precision,

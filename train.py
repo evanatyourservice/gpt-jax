@@ -85,17 +85,16 @@ class OptimizerConfig:
     type: str = "adamw"
     learning_rate: float = 0.001
     warmup_steps: int = 1000
-    weight_decay: float = 0.01
+    weight_decay: float = 0.1
     grad_clip: float = 1.0
     gradient_accumulation_steps: int = 1
     betas: Tuple[float, float] = (0.9, 0.95)
     preconditioner_update_probability: float = 1.0
-    update_global_norm_clip: Optional[float] = None
-    update_elementwise_clip: bool = False
     max_size_triangular: int = 0
     max_skew_triangular: int = 0
     precond_lr: float = 0.1
     precond_init_scale: float = 1.0
+    update_global_norm_clip: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -222,7 +221,10 @@ def main(config: TrainConfig):
     # wandb
     if config.wandb is not None and jax.process_index() == 0:
         wandb.init(**asdict(config.wandb))
-        wandb.config.update(asdict(config))
+        wandb_config = asdict(config)
+        wandb_config["jax_n_devices"] = jax.device_count()
+        wandb_config["jax_n_processes"] = jax.process_count()
+        wandb.config.update(wandb_config)
 
     block_size = config.model.n_positions
     using_gpu = jax.devices()[0].platform == "gpu"
@@ -291,22 +293,20 @@ def main(config: TrainConfig):
                 )
             )
         elif config.optimizer.type in ["psgd_affine", "affine"]:
+            update_prob_schedule = lambda n: jnp.maximum(jnp.exp(-0.001 * n), 0.1)
+            precond_lr_schedule = lambda n: jnp.maximum(jnp.exp(-0.001 * n), 0.01)
             optimizer.append(
                 affine(
-                    learning_rate=lr_schedule,
-                    preconditioner_update_probability=config.optimizer.preconditioner_update_probability,
+                    lr_schedule,
+                    update_prob_schedule,
                     b1=config.optimizer.betas[0],
-                    nesterov=False,
-                    update_global_norm_clip=config.optimizer.update_global_norm_clip,
-                    update_elementwise_clip=config.optimizer.update_elementwise_clip,
                     weight_decay=config.optimizer.weight_decay,
                     mask=param_decay_mask,
                     max_size_triangular=config.optimizer.max_size_triangular,
                     max_skew_triangular=config.optimizer.max_skew_triangular,
-                    step_normalizer_order="2nd",
-                    precond_lr=config.optimizer.precond_lr,
+                    precond_lr=precond_lr_schedule,
                     precond_init_scale=config.optimizer.precond_init_scale,
-                    seed=None,
+                    update_global_norm_clip=config.optimizer.update_global_norm_clip,
                     mu_dtype=jnp.bfloat16,
                     precision="tensorfloat32",
                 )
