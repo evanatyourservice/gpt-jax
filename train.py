@@ -293,11 +293,7 @@ def main(config: TrainConfig):
                 )
             )
         elif config.optimizer.type in ["psgd_affine", "affine"]:
-            update_prob_schedule = lambda n: jnp.maximum(jnp.exp(-0.001 * n), 0.1)
-            # precond_lr_schedule = lambda n: jnp.maximum(jnp.exp(-0.001 * n), 0.01)
-            precond_lr_schedule = lambda n: jnp.maximum(
-                0.1 * jnp.exp(-0.0005 * n), 0.01
-            )
+            update_prob_schedule = lambda n: jnp.maximum(jnp.exp(-0.001 * n), 0.05)
             optimizer.append(
                 affine(
                     lr_schedule,
@@ -307,7 +303,7 @@ def main(config: TrainConfig):
                     mask=param_decay_mask,
                     max_size_triangular=config.optimizer.max_size_triangular,
                     max_skew_triangular=config.optimizer.max_skew_triangular,
-                    precond_lr=precond_lr_schedule,
+                    precond_lr=config.optimizer.precond_lr,
                     precond_init_scale=config.optimizer.precond_init_scale,
                     update_global_norm_clip=config.optimizer.update_global_norm_clip,
                     mu_dtype=jnp.bfloat16,

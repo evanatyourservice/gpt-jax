@@ -13,5 +13,5 @@ python3 train.py \
     --optimizer.preconditioner_update_probability=0.5 \
     --optimizer.max_size_triangular=1000000000 \
     --optimizer.max_skew_triangular=1 \
-    --optimizer.precond_lr=0.1 \
+    --optimizer.precond_lr=0.01 \
     --optimizer.precond_init_scale=1.0
