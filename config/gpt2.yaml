@@ -34,7 +34,7 @@ model: !dataclass:GPT2Config
     embd_pdrop: 0.0
     attn_pdrop: 0.0
     layer_norm_epsilon: 0.00001
-    initializer_range: 0.01
+    initializer_range: 0.02
     summary_type: "cls_index"
     summary_use_proj: True
     summary_activation: None
