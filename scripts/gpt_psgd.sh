@@ -11,6 +11,7 @@ python3 train.py \
     --val_pattern=gs://uscentral1stuff/openwebtext/val_??.tfrecord \
     --optimizer.type=affine \
     --optimizer.weight_decay=0.000001 \
+    --optimizer.grad_clip=0.0 \
     --optimizer.preconditioner_update_probability=0.2 \
     --optimizer.max_size_triangular=1000000000 \
     --optimizer.max_skew_triangular=0 \
