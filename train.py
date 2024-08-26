@@ -39,7 +39,7 @@ jax.config.update("jax_threefry_partitionable", True)
 
 @dataclass(frozen=True)
 class GPT2Config:
-    vocab_size: int = 50257
+    vocab_size: int = 50304  # divisible by 64
     n_positions: int = 1024
     n_embd: int = 768
     n_layer: int = 12
@@ -295,9 +295,9 @@ def main(config: TrainConfig):
                 )
             )
         elif config.optimizer.type in ["psgd_affine", "affine"]:
-            update_prob_schedule = lambda n: jnp.maximum(jnp.exp(-0.0005 * n), 0.01)
+            update_prob_schedule = lambda n: jnp.maximum(jnp.exp(-0.002 * n), 0.01)
             precond_lr_schedule = lambda n: jnp.maximum(
-                0.1 * jnp.exp(-0.0005 * n), 0.01
+                0.2 * jnp.exp(-0.0015 * n), 0.01
             )
             optimizer.append(
                 affine(
@@ -311,8 +311,8 @@ def main(config: TrainConfig):
                     precond_lr=precond_lr_schedule,
                     precond_init_scale=config.optimizer.precond_init_scale,
                     update_global_norm_clip=config.optimizer.update_global_norm_clip,
-                    momentum_before_precond_update=False,  # experimental
-                    mu_dtype=jnp.float32,
+                    momentum_before_precond_update=True,  # experimental
+                    mu_dtype=jnp.bfloat16,
                     precision="tensorfloat32",
                     precond_sharding=precond_sharding,
                 )

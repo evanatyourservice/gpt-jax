@@ -23,7 +23,7 @@ wandb: !dataclass:WandbConfig
     project: owt
     mode: online
 model: !dataclass:GPT2Config
-    vocab_size: 50257
+    vocab_size: 50304  # divisible by 64
     n_positions: 1024
     n_embd: 768
     n_layer: 12
@@ -34,7 +34,7 @@ model: !dataclass:GPT2Config
     embd_pdrop: 0.0
     attn_pdrop: 0.0
     layer_norm_epsilon: 0.00001
-    initializer_range: 0.02
+    initializer_range: 0.01
     summary_type: "cls_index"
     summary_use_proj: True
     summary_activation: None
