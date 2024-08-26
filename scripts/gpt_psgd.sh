@@ -12,6 +12,7 @@ python3 train.py \
     --batch_size=192 \
     --bfloat16_compute \
     --optimizer.type=affine \
+    --optimizer.learning_rate=0.0014 \
     --optimizer.weight_decay=0.01 \
     --optimizer.preconditioner_update_probability=0.5 \
     --optimizer.max_size_triangular=0 \
