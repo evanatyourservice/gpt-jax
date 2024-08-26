@@ -306,7 +306,7 @@ def main(config: TrainConfig):
                     mask=param_decay_mask,
                     max_size_triangular=config.optimizer.max_size_triangular,
                     max_skew_triangular=config.optimizer.max_skew_triangular,
-                    precond_lr=precond_lr_schedule,
+                    precond_lr=config.optimizer.precond_lr,
                     precond_init_scale=config.optimizer.precond_init_scale,
                     update_global_norm_clip=config.optimizer.update_global_norm_clip,
                     momentum_before_precond_update=True,  # experimental
